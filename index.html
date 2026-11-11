@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="fo">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#f6f5ef">
+    <title>Fíggjarætlan</title>
+    <link rel="stylesheet" href="styles.css">
+    <script defer src="budget-core.js"></script>
+    <script defer src="editors.js"></script>
+    <script defer src="stats-insights.js"></script>
+    <script defer src="stats.js"></script>
+    <script defer src="csv-export.js"></script>
+    <script defer src="app.js"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Far til innihaldið</a>
+    <div class="app-shell">
+      <header class="site-header">
+        <div class="shell header-inner">
+          <button class="brand" id="home" type="button" aria-label="Fíggjarætlan, far til yvirlit">
+            <span class="brand-mark" aria-hidden="true">
+              <svg viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M6 21.5h20M8.5 17.5l5-5 4.1 4.1 5.8-6.6M19.7 10h3.7v3.7"/>
+              </svg>
+            </span>
+            <span class="brand-name">Fíggjarætlan<span class="brand-caption">Mín peningur</span></span>
+          </button>
+          <nav class="main-nav" aria-label="Høvuðsvalmynd">
+            <div role="tablist" aria-label="Fíggjarætlan" id="tabs"></div>
+          </nav>
+          <button class="demo-badge" id="open-storage" type="button" aria-haspopup="dialog"></button>
+        </div>
+      </header>
+
+      <section class="shell cloud-gate" id="cloud-gate" hidden>
+        <div class="card">
+          <p class="section-kicker">Mín peningur</p>
+          <h1>Fíggjarætlan</h1>
+          <p class="muted" id="cloud-gate-message" role="status"></p>
+          <div class="cloud-actions">
+            <a class="button primary" id="cloud-login" href="/auth/login" hidden>Rita inn við GitHub</a>
+            <button class="button secondary" id="cloud-gate-retry" type="button" hidden>Royn aftur</button>
+          </div>
+        </div>
+      </section>
+      <main class="shell app-main" id="main" tabindex="-1">
+        <section class="page-heading" aria-labelledby="page-title">
+          <div>
+            <p class="eyebrow" id="page-eyebrow"></p>
+            <h1 id="page-title"></h1>
+            <p class="page-subtitle" id="page-subtitle"></p>
+          </div>
+          <div class="heading-actions" id="heading-actions"></div>
+        </section>
+        <p class="notice" id="storage-notice" hidden></p>
+        <section class="notice cloud-sync" id="cloud-sync" aria-label="Samstilling" hidden>
+          <p id="cloud-sync-message" role="status"></p>
+          <div class="cloud-actions">
+            <a class="text-button" id="cloud-reconnect" href="/auth/login" hidden>Rita inn</a>
+            <button class="text-button" id="cloud-sync-retry" type="button" hidden>Royn aftur</button>
+            <button class="text-button" id="cloud-refresh-draft" type="button" hidden>Vís nýggjastu dátur</button>
+          </div>
+        </section>
+        <section id="view" role="tabpanel" tabindex="0"></section>
+        <footer class="app-footer">
+          <span>Fíggjarætlan</span>
+          <button class="text-button" type="button" id="footer-storage">Dátur og trygdaravrit</button>
+        </footer>
+      </main>
+    </div>
+
+    <dialog class="app-dialog" id="month-dialog" aria-labelledby="month-dialog-title">
+      <form class="dialog-form" id="month-form">
+        <div class="dialog-heading">
+          <h2 id="month-dialog-title">Vel mánað</h2>
+          <button type="button" class="icon-button" data-close-dialog aria-label="Lat aftur">×</button>
+        </div>
+        <div class="dialog-fields">
+          <label>Mánaður<select id="pick-month" required></select></label>
+          <label>Ár<input id="pick-year" type="number" min="1" max="9999" inputmode="numeric" required></label>
+        </div>
+        <div class="dialog-actions">
+          <button type="button" class="button secondary" id="go-current-month">Hesin mánaður</button>
+          <button type="submit" class="button primary">Vís mánað</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog class="app-dialog" id="storage-dialog" aria-labelledby="storage-title">
+      <div class="dialog-heading">
+        <h2 id="storage-title">Dátur og trygdaravrit</h2>
+        <button type="button" class="icon-button" data-close-dialog aria-label="Lat aftur">×</button>
+      </div>
+      <div class="storage-panel">
+        <p id="storage-description"></p>
+        <p>Tak eitt trygdaravrit niður, um tú vilt varðveita broytingarnar í einari fílu.</p>
+        <div class="dialog-actions">
+          <button type="button" class="button secondary" id="download-backup">Tak trygdaravrit niður</button>
+          <button type="button" class="button secondary" id="choose-backup">Vel trygdaravrit</button>
+          <input type="file" id="backup-file" accept=".json,application/json" hidden>
+        </div>
+        <p>CSV-fílur geva tær eitt yvirlit í einari fílu. JSON-avritið kann setast inn aftur í appina.</p>
+        <div class="dialog-actions">
+          <button type="button" class="button secondary" id="download-transactions-csv">Skrásetingar (CSV)</button>
+          <button type="button" class="button secondary" id="download-budgets-csv">Fíggjarætlanir (CSV)</button>
+        </div>
+        <p id="restore-notice" role="status" hidden></p>
+        <button type="button" class="button primary" id="restore-backup" hidden>Set valda avrit inn</button>
+        <button type="button" class="text-button" id="switch-ledger"></button>
+        <section id="cloud-pending-entries" class="cloud-pending-entries" hidden></section>
+        <button type="button" class="text-button" id="cloud-logout" hidden>Rita út</button>
+      </div>
+    </dialog>
+
+    <div class="toast" id="toast" role="status" hidden></div>
+    <noscript>Fíggjarætlan krevur, at JavaScript er virkið í kaganum.</noscript>
+  </body>
+</html>

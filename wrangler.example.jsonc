@@ -1,0 +1,30 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "your-budget-app",
+  "main": "cloud/worker.mjs",
+  "compatibility_date": "2026-11-10",
+  "workers_dev": true,
+  "preview_urls": false,
+  "assets": {
+    "directory": "dist",
+    "binding": "ASSETS",
+    "run_worker_first": ["/api/*", "/auth/*"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "your-budget-database",
+      "database_id": "YOUR_D1_DATABASE_ID",
+      "migrations_dir": "cloud/migrations"
+    }
+  ],
+  "send_metrics": false,
+  "vars": {
+    "OWNER_GITHUB_ID": "YOUR_NUMERIC_GITHUB_USER_ID",
+    "APP_ORIGIN": "https://your-budget-app.example.com",
+    "GITHUB_CLIENT_ID": "YOUR_GITHUB_OAUTH_CLIENT_ID"
+  },
+  "secrets": {
+    "required": ["GITHUB_CLIENT_SECRET"]
+  }
+}

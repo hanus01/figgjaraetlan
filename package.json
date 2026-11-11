@@ -1,0 +1,16 @@
+{
+  "name": "figgjaraetlan",
+  "version": "0.2.0",
+  "private": true,
+  "scripts": {
+    "build": "node build-cloud.mjs",
+    "preview:file": "node build-preview.mjs",
+    "test": "node tests/auth-ledger.mjs && node tests/sync.cjs && node tests/cloud-ui.cjs && node tests/categories.cjs && node tests/app-shell.cjs && node tests/stats.cjs && node tests/csv.cjs",
+    "dev": "npm run build && wrangler dev",
+    "deploy": "npm run build && wrangler deploy",
+    "test:runtime": "node tests/runtime.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "4.160.0"
+  }
+}
