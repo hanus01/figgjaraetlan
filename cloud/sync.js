@@ -5,8 +5,10 @@
   const storeName = 'ledger';
   const recordKey = 'owner';
   const notModified = Symbol('not modified');
+  const maxRestoreChanges = 5_000;
+  const maxRestoreBytes = 2_000_000;
   const messages = {
-    offline: 'Sambandið er burtur. Nýggjar skrásetingar verða sendar, tá ið sambandið kemur aftur.',
+    offline: 'Sambandið er burtur. Skrásetingar og rættingar verða sendar, tá ið sambandið kemur aftur.',
     onlineOnly: 'Far á netið fyri at goyma hesa broytingina.',
     signedOut: 'Rita inn fyri at samstilla dáturnar.',
     setup: 'Samstillingin er ikki sett upp enn.',
@@ -17,6 +19,10 @@
     duplicate: 'Ein onnur skráseting hevur sama eyðmerki. Henda skrásetingin er framvegis á hesi eindini.',
     rejected: 'Ein skráseting kundi ikki sendast. Hon er framvegis á hesi eindini.',
     invalid: 'Broytingin er ikki gild.',
+    tooLarge: 'Broytingin er ov stór til eina samstilling.',
+    correctionConflict: 'Skrásetingin er broytt ella strikað á einari aðrari eind. Vel, hvør broyting skal varðveitast.',
+    fixedAlreadyRecorded: 'Henda fasta útreiðslan er longu skrásett í mánaðinum.',
+    undoUnavailable: 'Henda strikingin kann ikki longur angrað.',
     pending: 'Send skrásetingarnar, ið bíða, áðrenn tú gert hesa broytingina.',
     signOutPending: 'Send skrásetingarnar, ið bíða, áðrenn tú ritar út.',
     otherOwner: 'Skrásetingar hjá einum øðrum brúkara bíða á hesi eindini. Rita inn við rætta brúkaranum fyri at senda tær.',
@@ -24,18 +30,23 @@
   };
 
   class SyncError extends Error {
-    constructor(code, status = 0) {
+    constructor(code, status = 0, data) {
       super(messages[code] ?? messages.unavailable);
       this.code = code;
       this.status = status;
+      this.data = data;
     }
   }
 
   function openDatabase() {
     return new Promise((resolve, reject) => {
-      const request = indexedDB.open(databaseName, 1);
+      // Version 2 preserves the existing store and prevents an old app window
+      // from treating queued corrections as if they were new purchases.
+      const request = indexedDB.open(databaseName, 2);
       let blocked = false;
-      request.onupgradeneeded = () => request.result.createObjectStore(storeName);
+      request.onupgradeneeded = ({ oldVersion }) => {
+        if (oldVersion === 0) request.result.createObjectStore(storeName);
+      };
       request.onblocked = () => {
         blocked = true;
         reject(new SyncError('storage'));
@@ -82,7 +93,7 @@
 
   async function request(path, { body, method = 'GET', expectJson = true, revision } = {}) {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 7500);
+    const timeout = setTimeout(() => controller.abort(), body?.type === 'restore' ? 30_000 : 7500);
     try {
       const headers = { Accept: 'application/json' };
       if (body !== undefined) headers['Content-Type'] = 'application/json';
@@ -99,8 +110,10 @@
       if (response.status === 401 || response.status === 403) throw new SyncError('signedOut', response.status);
       if (!response.ok) {
         const data = await response.json().catch(() => ({}));
-        const code = data?.code === 'duplicate' ? 'duplicate' : response.status === 409 ? 'conflict' : 'unavailable';
-        throw new SyncError(code, response.status);
+        const code = ['duplicate', 'fixedAlreadyRecorded'].includes(data?.code) ? data.code
+          : response.status === 409 ? 'conflict'
+          : response.status === 413 ? 'tooLarge' : 'unavailable';
+        throw new SyncError(code, response.status, data);
       }
       return expectJson ? await response.json() : undefined;
     } catch (error) {
@@ -132,32 +145,104 @@
     };
   }
 
-  function appendTransaction(expected, changes) {
+  function sameTransaction(first, second) {
+    return first === second || (first && second
+      && first.id === second.id && first.date === second.date
+      && first.description === second.description && first.categoryId === second.categoryId
+      && first.type === second.type && first.amountOre === second.amountOre);
+  }
+
+  function queuedTransaction(expected, changes) {
     const { categories, months, transactions } = changes;
     if (categories.upsert.length || categories.remove.length || months.remove.length
-      || transactions.remove.length || transactions.upsert.length !== 1) return null;
+      || transactions.remove.length + transactions.upsert.length !== 1) return null;
+    if (transactions.remove.length) {
+      if (months.upsert.length) return null;
+      const transaction = expected.transactions.find(({ id }) => id === transactions.remove[0]);
+      return transaction ? { kind: 'delete', transaction, before: transaction } : null;
+    }
+
     const [transaction] = transactions.upsert;
-    if (expected.transactions.some(({ id }) => id === transaction.id)) return null;
     const key = transaction.date.slice(0, 7);
     const [month] = months.upsert;
     if (month && (months.upsert.length !== 1 || month.key !== key || expected.months[key]
       || month.value.status !== 'active' || month.value.budget !== null)) return null;
-    return transaction;
+    const before = expected.transactions.find(({ id }) => id === transaction.id);
+    return before ? { kind: 'edit', transaction, before } : { transaction };
+  }
+
+  function kindOf(operation) {
+    return operation.kind ?? 'append';
+  }
+
+  function nextTransaction(current, operation) {
+    switch (kindOf(operation)) {
+      case 'append': return current ?? (operation.fixedCost && operation.error ? null : operation.transaction);
+      case 'undo': return !operation.error && !current ? operation.transaction : current;
+      case 'edit': return !operation.error && sameTransaction(current, operation.before) ? operation.transaction : current;
+      case 'delete': return !operation.error && sameTransaction(current, operation.before) ? null : current;
+      default: return current;
+    }
+  }
+
+  function visibleTransaction(record, id) {
+    let item = record.server.state.transactions.find((entry) => entry.id === id);
+    for (const operation of record.outbox) {
+      if (operation.transaction.id !== id) continue;
+      item = nextTransaction(item, operation);
+      if (operation.error) break;
+    }
+    return item;
+  }
+
+  function hasFixedExpense(transactions, transaction) {
+    const month = transaction.date.slice(0, 7);
+    for (const entry of transactions) {
+      if (entry.id !== transaction.id && entry.type === 'expense'
+        && entry.categoryId === transaction.categoryId && entry.date.slice(0, 7) === month) return true;
+    }
+    return false;
   }
 
   function visibleState({ server, outbox }) {
     if (!outbox.length) return server.state;
-    const transactionIds = new Set(server.state.transactions.map(({ id }) => id));
+    const transactions = new Map(server.state.transactions.map((item) => [item.id, item]));
     const months = { ...server.state.months };
-    const transactions = [...server.state.transactions];
-    for (const { transaction } of outbox) {
-      if (transactionIds.has(transaction.id)) continue;
-      const key = transaction.date.slice(0, 7);
-      months[key] ??= { status: 'active', budget: null };
-      transactions.push(transaction);
-      transactionIds.add(transaction.id);
+    const blocked = new Set();
+    for (const operation of outbox) {
+      const { id } = operation.transaction;
+      if (blocked.has(id)) continue;
+      const current = transactions.get(id);
+      if (!current && operation.fixedCost && hasFixedExpense(transactions.values(), operation.transaction)) {
+        blocked.add(id);
+        continue;
+      }
+      const next = nextTransaction(current, operation);
+      if (next) {
+        months[next.date.slice(0, 7)] ??= { status: 'active', budget: null };
+        transactions.set(id, next);
+      } else transactions.delete(id);
+      if (operation.error) blocked.add(id);
     }
-    return { ...server.state, months, transactions };
+    return { ...server.state, months, transactions: [...transactions.values()] };
+  }
+
+  function mutationFor(operation) {
+    const { operationId, transaction, before, undoOf, fixedCost } = operation;
+    const kind = kindOf(operation);
+    if (kind === 'append') return { type: 'append', operationId, transaction, ...(fixedCost ? { fixedCost } : {}) };
+    if (kind === 'undo') return { type: 'correction', operationId, before: null, after: transaction, undoOf };
+    return { type: 'correction', operationId, before, after: kind === 'delete' ? null : transaction };
+  }
+
+  function sendableOperation(outbox) {
+    const blocked = new Set();
+    for (const operation of outbox) {
+      const { id } = operation.transaction;
+      if (!operation.error && !blocked.has(id)) return operation;
+      blocked.add(id);
+    }
+    return null;
   }
 
   function create({ onChange = () => {} } = {}) {
@@ -171,6 +256,7 @@
     let shownOwner;
     let shownRevision;
     const snapshotOwners = new WeakMap();
+    const undoDeletes = new Map();
     let database;
     let storageWork = Promise.resolve();
     let networkWork = Promise.resolve();
@@ -210,17 +296,32 @@
         : access === 'offline' ? 'offline'
         : !visible ? 'checking'
         : pending ? 'pending' : 'synced';
-      const version = visible ? JSON.stringify([record.ownerId, record.server.revision, record.outbox.map(({ operationId }) => operationId)]) : null;
+      const version = visible ? JSON.stringify([record.ownerId, record.server.revision,
+        record.outbox.map(({ operationId, error: problem }) => [operationId, Boolean(problem)])]) : null;
       const state = version === shownVersion ? snapshot.state : visible ? visibleState(record) : null;
+      const ownerId = visible ? record.ownerId : undefined;
+      if (ownerId !== shownOwner) undoDeletes.clear();
       shownVersion = version;
-      shownOwner = visible ? record.ownerId : undefined;
+      shownOwner = ownerId;
       shownRevision = visible ? record.server.revision : undefined;
       if (state) snapshotOwners.set(state, shownOwner);
-      const details = pendingTransactions.map(({ operationId, transaction, error: problem }) => ({ operationId, transaction, error: problem }));
+      const details = pendingTransactions.map((operation) => {
+        const { operationId, transaction, error: problem, conflict } = operation;
+        const kind = kindOf(operation);
+        const detail = { operationId, transaction, kind, error: problem };
+        if (conflict) {
+          detail.conflict = true;
+          detail.current = record.server.state.transactions.find(({ id }) => id === transaction.id) ?? null;
+          detail.canKeepMine = Boolean(detail.current && (kind === 'edit' || kind === 'delete')
+            && !sameTransaction(detail.current, operation.before)
+            && !record.outbox.some((item) => item.undoOf === operationId));
+        }
+        return detail;
+      });
       const changed = state !== snapshot.state || pending !== snapshot.pending || phase !== snapshot.phase
         || error !== snapshot.error || configured !== snapshot.configured
         || JSON.stringify(details) !== JSON.stringify(snapshot.pendingTransactions);
-      snapshot = { state, pending, phase, error, configured, pendingTransactions: details };
+      snapshot = { state, ownerId, pending, phase, error, configured, pendingTransactions: details };
       if (changed) onChange(snapshot);
     }
 
@@ -299,7 +400,11 @@
         if (force && (record.problem || record.outbox.some((operation) => operation.error))) {
           await accessStorage((stored) => {
             if (stored?.ownerId !== ownerId || !stored.offlineAllowed) throw new SyncError('signedOut');
-            return { ...stored, problem: null, outbox: stored.outbox.map(({ operationId, transaction }) => ({ operationId, transaction })) };
+            return { ...stored, problem: null, outbox: stored.outbox.map((item) => {
+              if (!item.error || item.conflict) return item;
+              const { error: _error, ...pending } = item;
+              return pending;
+            }) };
           });
         }
         const data = await request('/api/ledger', { revision: record.server?.revision });
@@ -311,20 +416,32 @@
           publish();
         } else await cacheServer(ownerId, data);
         for (;;) {
-          await accessStorage();
-          if (!record || record.ownerId !== ownerId || !record.offlineAllowed) throw new SyncError('signedOut');
-          const operation = record.outbox.find((item) => !item.error);
+          let operation;
+          await accessStorage((stored) => {
+            if (!stored || stored.ownerId !== ownerId || !stored.offlineAllowed) throw new SyncError('signedOut');
+            operation = sendableOperation(stored.outbox);
+            if (!operation || operation.attempted !== false) return stored;
+            // Mark it before sending so another tab cannot rewrite the same
+            // operation while its original payload may already reach the server.
+            return { ...stored, outbox: stored.outbox.map((item) => item === operation ? { ...item, attempted: true } : item) };
+          });
           if (!operation) break;
-          const { operationId, transaction } = operation;
+          const { operationId } = operation;
           try {
-            const data = await request('/api/ledger', { method: 'POST', body: { type: 'append', operationId, transaction } });
+            const data = await request('/api/ledger', { method: 'POST', body: mutationFor(operation) });
             await cacheServer(ownerId, data, operationId);
           } catch (error) {
             if (![400, 404, 409, 413, 422].includes(error.status)) throw error;
-            const problem = error.code === 'duplicate' ? messages.duplicate : messages.rejected;
+            const conflict = kindOf(operation) !== 'append' && error.code === 'conflict';
+            const problem = conflict ? messages.correctionConflict
+              : messages[error.code === 'unavailable' || error.code === 'conflict' ? 'rejected' : error.code];
+            const server = error.data?.state ? validServer(error.data) : null;
             await accessStorage((stored) => {
               if (stored?.ownerId !== ownerId || !stored.offlineAllowed) throw new SyncError('signedOut');
-              return { ...stored, outbox: stored.outbox.map((item) => item.operationId === operationId ? { ...item, error: problem } : item) };
+              return {
+                ...stored, server: server?.revision > stored.server.revision ? server : stored.server,
+                outbox: stored.outbox.map((item) => item.operationId === operationId ? { ...item, error: problem, conflict } : item),
+              };
             });
             publish();
           }
@@ -365,7 +482,52 @@
       return started;
     }
 
-    async function save(nextState, { expectedState = snapshot.state, replace = false } = {}) {
+    function flushWhenOnline() {
+      if (navigator.onLine !== false) {
+        if (background) refreshAgain = true;
+        else void refresh();
+      }
+    }
+
+    async function queueTransaction(ownerId, operation) {
+      let cancelledAppend;
+      const { transaction, operationId, before } = operation;
+      const kind = kindOf(operation);
+      await accessStorage((stored) => {
+        if (stored?.ownerId !== ownerId || !stored.offlineAllowed) throw new SyncError('signedOut');
+        if (!stored.server) throw new SyncError('stale');
+        const pending = stored.outbox.filter((item) => item.transaction.id === transaction.id);
+        if (kind === 'append') {
+          if (pending.length || visibleTransaction(stored, transaction.id)) throw new SyncError('duplicate');
+          if (operation.fixedCost && hasFixedExpense(visibleState(stored).transactions, transaction)) {
+            throw new SyncError('fixedAlreadyRecorded');
+          }
+        } else if (pending.some((item) => item.error)
+          || !sameTransaction(visibleTransaction(stored, transaction.id), before)) throw new SyncError('stale');
+
+        const [first] = pending;
+        if (pending.length === 1 && kindOf(first) === 'append' && first.attempted === false) {
+          if (kind === 'delete') {
+            cancelledAppend = first;
+            return { ...stored, outbox: stored.outbox.filter((item) => item !== first) };
+          }
+          const preserveFixedCost = first.fixedCost && first.transaction.categoryId === transaction.categoryId
+            && first.transaction.date.slice(0, 7) === transaction.date.slice(0, 7) && transaction.type === 'expense';
+          const editedAppend = { operationId, transaction, attempted: false, ...(preserveFixedCost ? { fixedCost: true } : {}) };
+          return { ...stored, outbox: stored.outbox.map((item) => item === first ? editedAppend : item) };
+        }
+        return { ...stored, outbox: [...stored.outbox, operation] };
+      });
+      if (kind === 'delete') {
+        undoDeletes.set(operationId, { ownerId, transaction, cancelledAppend });
+        if (undoDeletes.size > 32) undoDeletes.delete(undoDeletes.keys().next().value);
+      }
+      publish();
+      flushWhenOnline();
+      return { ok: true, operationId };
+    }
+
+    async function save(nextState, { expectedState = snapshot.state, replace = false, fixedCost = false } = {}) {
       if (!expectedState || !snapshot.state) return { ok: false, message: messages.signedOut };
       const ownerId = snapshotOwners.get(expectedState);
       if (!ownerId || ownerId !== shownOwner || record?.ownerId !== ownerId || !record.offlineAllowed) {
@@ -373,23 +535,14 @@
       }
       if (!core.validateState(nextState)) return { ok: false, message: messages.invalid };
       const changes = changesBetween(expectedState, nextState);
-      const transaction = replace ? null : appendTransaction(expectedState, changes);
-      if (transaction) {
+      const queued = replace ? null : queuedTransaction(expectedState, changes);
+      if (fixedCost && (!queued || kindOf(queued) !== 'append' || queued.transaction.type !== 'expense'
+        || !queued.transaction.categoryId)) return { ok: false, message: messages.invalid };
+      if (queued) {
         try {
-          const operationId = core.newId();
-          await accessStorage((stored) => {
-            if (stored?.ownerId !== ownerId || !stored.offlineAllowed) throw new SyncError('signedOut');
-            if (!stored.server) throw new SyncError('stale');
-            if (stored.server.state.transactions.some(({ id }) => id === transaction.id)
-              || stored.outbox.some((item) => item.transaction.id === transaction.id)) throw new SyncError('duplicate');
-            return { ...stored, outbox: [...stored.outbox, { operationId, transaction }] };
+          return await queueTransaction(ownerId, {
+            ...queued, operationId: core.newId(), attempted: false, ...(fixedCost ? { fixedCost: true } : {}),
           });
-          publish();
-          if (navigator.onLine !== false) {
-            if (background) refreshAgain = true;
-            else void refresh();
-          }
-          return { ok: true };
         } catch (error) {
           return { ok: false, message: error.message };
         }
@@ -407,10 +560,14 @@
           if (record?.ownerId !== ownerId || !record.offlineAllowed) throw new SyncError('signedOut');
           if (record.server.revision !== baseRevision) throw new SyncError('stale');
           if (record.outbox.length) throw new SyncError('pending');
-          const key = JSON.stringify([ownerId, baseRevision, changes]);
+          const type = replace ? 'restore' : 'patch';
+          const key = JSON.stringify([type, ownerId, baseRevision, changes]);
           if (uncertainPatch?.key !== key) uncertainPatch = { key, operationId: core.newId() };
           const operationId = uncertainPatch.operationId;
-          const data = await request('/api/ledger', { method: 'POST', body: { type: 'patch', operationId, baseRevision, changes } });
+          const body = { type, operationId, baseRevision, changes };
+          if (replace && (Object.values(changes).reduce((total, group) => total + group.upsert.length + group.remove.length, 0) > maxRestoreChanges
+            || new TextEncoder().encode(JSON.stringify(body)).byteLength > maxRestoreBytes)) throw new SyncError('tooLarge');
+          const data = await request('/api/ledger', { method: 'POST', body });
           uncertainPatch = undefined;
           await cacheServer(ownerId, data, undefined, true);
           return { ok: true };
@@ -441,11 +598,71 @@
       try {
         await accessStorage((stored) => {
           if (stored?.ownerId !== ownerId || !stored.offlineAllowed) throw new SyncError('signedOut');
-          if (stored.outbox.some((operation) => operation.operationId === operationId && !operation.error)) throw new SyncError('pending');
-          return { ...stored, outbox: stored.outbox.filter((operation) => operation.operationId !== operationId || !operation.error) };
+          const rejected = stored.outbox.find((operation) => operation.operationId === operationId);
+          if (!rejected) throw new SyncError('stale');
+          if (!rejected.error) throw new SyncError('pending');
+          return { ...stored, outbox: stored.outbox.filter((operation) => operation.transaction.id !== rejected.transaction.id) };
         });
         publish();
         return { ok: true };
+      } catch (error) {
+        return { ok: false, message: error.message };
+      }
+    }
+
+    async function keepPending(operationId, current = snapshot.pendingTransactions.find((item) => item.operationId === operationId)?.current) {
+      if (!snapshot.state) return { ok: false, message: messages.signedOut };
+      if (!current) return { ok: false, message: messages.stale };
+      const ownerId = record.ownerId;
+      try {
+        await accessStorage((stored) => {
+          if (stored?.ownerId !== ownerId || !stored.offlineAllowed) throw new SyncError('signedOut');
+          const rejected = stored.outbox.find((item) => item.operationId === operationId);
+          if (!rejected?.conflict || !['edit', 'delete'].includes(kindOf(rejected))
+            || stored.outbox.some((item) => item.undoOf === operationId)) throw new SyncError('stale');
+          const latest = stored.server.state.transactions.find(({ id }) => id === rejected.transaction.id);
+          if (!sameTransaction(latest, current)) throw new SyncError('stale');
+          const { error: _error, conflict: _conflict, ...operation } = rejected;
+          const retry = {
+            ...operation, before: latest, operationId: core.newId(), attempted: false,
+            transaction: kindOf(operation) === 'delete' ? latest : operation.transaction,
+          };
+          return { ...stored, outbox: stored.outbox.map((item) => item === rejected ? retry : item) };
+        });
+        undoDeletes.delete(operationId);
+        publish();
+        flushWhenOnline();
+        return { ok: true };
+      } catch (error) {
+        return { ok: false, message: error.message };
+      }
+    }
+
+    async function undoDelete(operationId) {
+      if (!snapshot.state) return { ok: false, message: messages.signedOut };
+      const deletion = undoDeletes.get(operationId);
+      if (!deletion || deletion.ownerId !== shownOwner) return { ok: false, message: messages.undoUnavailable };
+      const { ownerId, transaction, cancelledAppend } = deletion;
+      const undoId = core.newId();
+      try {
+        await accessStorage((stored) => {
+          if (stored?.ownerId !== ownerId || !stored.offlineAllowed) throw new SyncError('signedOut');
+          if (undoDeletes.get(operationId) !== deletion || visibleTransaction(stored, transaction.id)
+            || stored.outbox.some((item) => item.transaction.id === transaction.id && item.error)) {
+            throw new SyncError('undoUnavailable');
+          }
+          const operation = { operationId: undoId, transaction, attempted: false };
+          if (!cancelledAppend) Object.assign(operation, { kind: 'undo', undoOf: operationId });
+          else if (cancelledAppend.fixedCost) {
+            if (hasFixedExpense(visibleState(stored).transactions, transaction)) throw new SyncError('fixedAlreadyRecorded');
+            operation.fixedCost = true;
+          }
+          return { ...stored, outbox: [...stored.outbox, operation] };
+        });
+        undoDeletes.delete(operationId);
+        publish();
+        flushWhenOnline();
+        return { ok: true, operationId: undoId };
       } catch (error) {
         return { ok: false, message: error.message };
       }
@@ -472,7 +689,7 @@
       });
     }
 
-    return { start, save, retry: () => refresh(true), signOut, discardPending, getStatus: () => snapshot };
+    return { start, save, retry: () => refresh(true), signOut, discardPending, keepPending, undoDelete, getStatus: () => snapshot };
   }
 
   globalThis.BudgetSync = { create };

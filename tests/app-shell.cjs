@@ -41,10 +41,17 @@ async function run() {
   selectFile(JSON.stringify(restored));
   await tick();
   assert.equal(get('#restore-backup').hidden, false);
+  assert.match(get('#restore-notice').textContent, /Desember 1999 – November 2026/);
+  assert.match(get('#restore-notice').textContent, /0 nýggjar · 1 broyttar · 0 strikaðar/);
   assert.deepEqual(app.ledger(), original, 'Choosing a backup must only preview it');
+  assert.equal(get('#restore-backup').disabled, true);
+  click('#download-restore-safety');
+  assert.deepEqual(app.ledger(), original, 'Safety backup alone does not restore');
+  assert.equal(get('#restore-backup').disabled, false);
   click('#restore-backup');
   await tick();
   assert.deepEqual(app.ledger(), restored);
+  assert.deepEqual(JSON.parse(downloads.at(-1).content).state, original.state, 'Previous ledger is downloaded before restore');
   assert.equal(get('#restore-backup').hidden, true);
   assert.equal(get('#storage-dialog').hasAttribute('open'), false);
   console.log('PASS invalid backups are rejected and valid JSON restores exactly only after explicit restore');
@@ -84,5 +91,36 @@ async function run() {
   click('#home');
   assert.ok(get('#page-eyebrow').textContent.includes('November 2026'));
   console.log('PASS month picker respects calendar boundaries and Home returns to the current month');
+
+  click('#tab-transactions');
+  const draft = get('#transaction-form').elements;
+  draft.description.value = 'Draft saved across app close';
+  draft.description.dispatchEvent(new SimEvent('input', { bubbles: true }));
+  draft.amount.value = '18,25';
+  draft.amount.dispatchEvent(new SimEvent('input', { bubbles: true }));
+  draft.category.value = 'phone';
+  draft.category.dispatchEvent(new SimEvent('change', { bubbles: true }));
+  const reopened = loadApp(source, original, { storage: app.storage });
+  assert.equal(reopened.get('#draft-notice').hidden, false);
+  reopened.click('#resume-draft');
+  const resumed = reopened.get('#transaction-form');
+  assert.equal(resumed.elements.description.value, 'Draft saved across app close');
+  assert.equal(resumed.elements.amount.value, '18,25');
+  resumed.requestSubmit();
+  const recorded = reopened.ledger().state.transactions.find(({ description }) => description === 'Draft saved across app close');
+  assert.equal(recorded.amountOre, 1825);
+  reopened.click('#tab-overview');
+  assert.equal(reopened.get('#draft-notice').hidden, true, 'A successfully saved draft clears before rendering again');
+  console.log('PASS an unfinished purchase survives a new app session and is removed as a draft after save');
+
+  reopened.click('#tab-transactions');
+  const remove = reopened.document.querySelectorAll('[data-remove]').find(button => button.dataset.remove === recorded.id);
+  assert.ok(remove, 'Recorded transaction can be removed');
+  remove.click();
+  assert.ok(!reopened.ledger().state.transactions.some(({ id }) => id === recorded.id));
+  reopened.click('#undo-delete');
+  assert.deepEqual(reopened.ledger().state.transactions.find(({ id }) => id === recorded.id), recorded);
+  console.log('PASS Undo restores the exact transaction and ID after deletion');
+
 }
 run().catch(error => { console.error(error); process.exitCode = 1; });

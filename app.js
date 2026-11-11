@@ -46,6 +46,7 @@
   };
   const statuses = { active: 'Virkin', completed: 'Liðugur', skipped: 'Lopin um' };
   const storageKey = 'figgjaraetlan-ledger-v1';
+  const draftStore = globalThis.BudgetDraftStore.create(`${storageKey}-drafts`);
   const get = (id) => document.getElementById(id);
   const view = get('view');
   const tabs = get('tabs');
@@ -54,8 +55,16 @@
   let month = core.today().slice(0, 7);
   let tab = 'overview';
   let transactionId;
+  let transactionFilter;
+  let showFixedCosts = false;
   let toastTimer;
+  let lastDeletion;
+  let draftToResume;
+  let draftStorageUnavailable = false;
+  const visibleDraftKeys = new Set();
   let backupToRestore;
+  let backupPreviewState;
+  let safetyCopyState;
   let restoreRead = 0;
   let storageAvailable = true;
   let storageReadError = false;
@@ -93,20 +102,90 @@
     }
   }
 
-  function toast(message) {
-    const notice = get('toast');
-    notice.innerHTML = `${icon('info')}<span>${html(message)}</span>`;
-    notice.hidden = false;
-    clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => { notice.hidden = true; }, 4000);
+  function draftScope() {
+    if (!ledger) return null;
+    if (cloud) return cloudStatus.ownerId ? `owner:${cloudStatus.ownerId}` : null;
+    return `file:${ledger.mode}`;
   }
 
-  function save(nextLedger, message, replace = false, expectedState = ledger?.state) {
+  function paintDraftNotice() {
+    const notice = get('draft-notice');
+    const scope = draftScope();
+    draftToResume = draftStore.entries(scope).find(([key, { meta }]) => !visibleDraftKeys.has(key)
+      && ['transactions', 'budget'].includes(meta.tab) && core.isMonth(meta.month));
+    notice.hidden = !draftToResume && !draftStorageUnavailable;
+    const [key, record] = draftToResume ?? [];
+    const missing = record?.meta.transactionId && !ledger?.state.transactions.some(({ id }) => id === record.meta.transactionId);
+    get('draft-message').textContent = draftStorageUnavailable
+      ? 'Kagin kann ikki varðveita kladdur, tá ið appin verður latin aftur.'
+      : missing ? 'Ein kladda er eftir fyri eina skráseting, sum er strikað.'
+        : record ? `Ógoymd kladda · ${record.meta.tab === 'budget' ? 'Fíggjarætlan' : 'Skráseting'} · ${core.monthLabel(record.meta.month)}` : '';
+    get('resume-draft').hidden = !key || Boolean(missing);
+    get('discard-draft').hidden = !key;
+  }
+
+  function editorDrafts(scope, targetTab, targetMonth) {
+    function markVisible(key) {
+      if (key.startsWith('tx:')) {
+        for (const current of visibleDraftKeys) if (current.startsWith('tx:')) visibleDraftKeys.delete(current);
+      }
+      visibleDraftKeys.add(key);
+    }
+    return {
+      read(key) {
+        markVisible(key);
+        const data = draftStore.read(scope, key);
+        if (data !== undefined) editorDraft = true;
+        return data;
+      },
+      write(key, data, meta = {}) {
+        if (scope !== draftScope()) return;
+        markVisible(key);
+        editorDraft = true;
+        const id = key.startsWith('tx:edit:') ? key.slice(8)
+          : key.startsWith('tx:') && !['tx:new', 'tx:fixed'].includes(key) ? key.slice(3) : undefined;
+        draftStorageUnavailable = !draftStore.write(scope, key, data, {
+          tab: targetTab,
+          month: core.isMonth(meta.month) ? meta.month : targetMonth,
+          transactionId: meta.transactionId ?? id,
+          showFixedCosts: key === 'tx:fixed' || Boolean(meta.showFixedCosts),
+        });
+        paintDraftNotice();
+      },
+      clear(key) {
+        if (scope !== draftScope()) return;
+        draftStore.discard(scope, key);
+        visibleDraftKeys.delete(key);
+        paintDraftNotice();
+      },
+    };
+  }
+
+  function toast(message, undo = false) {
+    const notice = get('toast');
+    notice.innerHTML = `${icon('info')}<span>${html(message)}</span>${undo ? ' <button class="text-button" type="button" id="undo-delete">Angra</button>' : ''}`;
+    if (undo) get('undo-delete').addEventListener('click', () => void undoDeletion());
+    notice.hidden = false;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { notice.hidden = true; }, undo ? 16000 : 4000);
+  }
+
+  function save(nextLedger, message, replace = false, expectedState = ledger?.state, options = {}) {
     if (!validLedger(nextLedger)) {
       toast('Broytingin kundi ikki goymast. Kanna upplýsingarnar.');
       return false;
     }
-    if (cloud) return saveToCloud(nextLedger.state, message, replace, expectedState);
+    const scope = draftScope();
+    function committed(result) {
+      if (options.draftKey) draftStore.discard(scope, options.draftKey);
+      if (replace) lastDeletion = undefined;
+      if (!options.undoTransaction || (cloud && !result?.operationId)) return false;
+      lastDeletion = { scope, transaction: options.undoTransaction, operationId: result?.operationId };
+      return true;
+    }
+    if (cloud) return runCloudMutation(() => cloud.save(nextLedger.state, {
+      expectedState, replace, fixedCost: options.fixedCost === true,
+    }), message, committed);
     if (storageReadError && !replace) {
       toast('Lat Dátur upp og vel eitt trygdaravrit ella byrja av nýggjum.');
       return false;
@@ -125,31 +204,50 @@
         return false;
       }
     }
+    const undo = committed();
     ledger = nextLedger;
     storageReadError = false;
     render();
-    if (message) toast(message);
+    if (message) toast(message, undo);
     return true;
   }
 
-  async function saveToCloud(nextState, message, replace, expectedState) {
+  async function undoDeletion() {
+    if (!lastDeletion || savingCloud || !ledger || lastDeletion.scope !== draftScope()) return;
+    const deletion = lastDeletion;
+    const { transaction, operationId } = deletion;
+    if (cloud) {
+      await runCloudMutation(() => cloud.undoDelete(operationId), 'Skrásetingin er sett inn aftur.', () => {
+        if (lastDeletion === deletion) lastDeletion = undefined;
+      }, true);
+      return;
+    }
+    if (ledger.state.transactions.some(({ id }) => id === transaction.id)) {
+      toast('Skrásetingin er longu í roknskapinum.');
+      return;
+    }
+    if (save({ ...ledger, state: { ...ledger.state, transactions: [...ledger.state.transactions, transaction] } }, 'Skrásetingin er sett inn aftur.')) lastDeletion = undefined;
+  }
+
+  async function runCloudMutation(action, message, committed, retryUndo = false) {
     if (savingCloud) return false;
     savingCloud = true;
-    const controls = Array.from(document.querySelectorAll('#view input, #view select, #view textarea, #view button, #tabs button, #heading-actions button, #home, #open-storage'));
+    const controls = Array.from(document.querySelectorAll('#view input, #view select, #view textarea, #view button, #tabs button, #heading-actions button, #home, #open-storage, #undo-delete, #restore-backup'));
     const disabledStates = controls.map((control) => control.disabled);
     for (const control of controls) control.disabled = true;
     view.setAttribute('aria-busy', 'true');
     try {
-      const result = await cloud.save(nextState, { expectedState, replace });
+      const result = await action();
       if (!result.ok) {
-        toast(result.message);
+        toast(result.message, retryUndo && lastDeletion?.scope === draftScope());
         return false;
       }
+      const undo = committed?.(result) ?? false;
       if (ledger) render();
-      toast(cloudStatus.pending ? 'Goymt á hesi eindini. Bíðar eftir samstilling.' : message);
+      if (message) toast(cloudStatus.pending ? 'Goymt á hesi eindini. Bíðar eftir samstilling.' : message, undo);
       return true;
     } catch {
-      toast('Broytingin kundi ikki goymast. Royn aftur.');
+      toast('Broytingin kundi ikki goymast. Royn aftur.', retryUndo && lastDeletion?.scope === draftScope());
       return false;
     } finally {
       savingCloud = false;
@@ -190,19 +288,37 @@
     get('cloud-reconnect').hidden = phase !== 'signed-out';
     get('cloud-sync-retry').hidden = phase !== 'error' && phase !== 'offline' && !pending;
     get('cloud-refresh-draft').hidden = !draftIsStale;
+    get('cloud-review-pending').hidden = !(cloudStatus.pendingTransactions ?? []).some(({ error }) => error);
   }
 
   function updateCloud(next) {
+    const ownerChanged = Boolean(ledger && cloudStatus.ownerId && cloudStatus.ownerId !== next.ownerId);
     cloudStatus = next;
+    if (ownerChanged) {
+      visibleDraftKeys.clear();
+      transactionId = undefined;
+      transactionFilter = undefined;
+      showFixedCosts = false;
+      tab = 'overview';
+      month = core.today().slice(0, 7);
+      lastDeletion = undefined;
+      draftStorageUnavailable = false;
+      clearRestoreSelection();
+      if (storageDialog.open) storageDialog.close();
+      get('toast').hidden = true;
+    }
     if (!next.state) {
       ledger = null;
       view.replaceChildren();
+      visibleDraftKeys.clear();
+      paintDraftNotice();
       if (storageDialog.open) storageDialog.close();
     } else {
       const previous = ledger?.state;
       ledger = { mode: 'personal', state: next.state };
-      if (previous !== next.state) {
-        if (previous && (editorDraft || savingCloud)) draftIsStale = true;
+      if (ownerChanged) render();
+      else if (previous !== next.state) {
+        if (previous && (editorDraft || savingCloud || view.querySelector('[data-category-manager]')?.open)) draftIsStale = true;
         else render();
       }
     }
@@ -213,6 +329,12 @@
   function navigate(nextTab, nextMonth = month, options = {}) {
     if (!ledger || savingCloud) return;
     if (!Object.hasOwn(labels, nextTab) || !core.isMonth(nextMonth)) return;
+    if (nextTab === 'transactions') {
+      if (Object.hasOwn(options, 'transactionFilter')) transactionFilter = options.transactionFilter;
+      else if (nextMonth !== month) transactionFilter = undefined;
+      if (Object.hasOwn(options, 'showFixedCosts')) showFixedCosts = options.showFixedCosts;
+      if (options.transactionId) showFixedCosts = false;
+    }
     tab = nextTab;
     month = nextMonth;
     transactionId = options.transactionId;
@@ -262,7 +384,7 @@
       get('pick-month').value = month.slice(5);
       monthDialog.showModal();
     });
-    get('quick-add')?.addEventListener('click', () => navigate('transactions', month, { focusView: true, scroll: true }));
+    get('quick-add')?.addEventListener('click', () => navigate('transactions', month, { focusView: true, scroll: true, showFixedCosts: false, transactionFilter: null }));
   }
 
   function amount(ore) {
@@ -281,7 +403,7 @@
     const planText = allowance === null ? 'Ongin játtan' : `${amount(spent)} av ${amount(allowance)}`;
     const remainingText = allowance === null ? amount(spent) : `${amount(Math.abs(remaining))} ${over ? 'ov nógv' : 'eftir'}`;
     return `<div class="category-row${over ? ' over' : ''}${allowance === null ? ' unplanned' : ''}">
-      <div class="category-line"><strong class="category-name">${html(entry.label)}</strong><span class="category-amount">${remainingText}</span></div>
+      <div class="category-line"><button class="text-button category-name" type="button" data-category-history="${html(entry.categoryId ?? '')}" aria-label="Vís skrásetingar í ${html(entry.label)}">${html(entry.label)} ${icon('arrow-right')}</button><span class="category-amount">${remainingText}</span></div>
       ${allowance === null ? '' : `<div class="progress-track" aria-hidden="true"><div class="progress-fill" style="width:${progress}%"></div></div>`}
       <p class="category-meta">${planText}${entry.kind === 'fixed' ? ' · Føst útreiðsla' : ''}</p>
     </div>`;
@@ -303,8 +425,8 @@
     const budget = state.months[month]?.budget;
     const balance = summary.plannedExpenses - summary.spent;
     const recent = state.transactions.filter((entry) => entry.date.startsWith(month)).reverse().sort((a, b) => b.date.localeCompare(a.date)).slice(0, 5);
-    const categories = new Map(state.categories.map((entry) => [entry.id, entry.label]));
-    for (const line of budget?.allocations ?? []) categories.set(line.categoryId, line.label);
+    const categories = core.categoryLabels?.(state, month) ?? new Map(state.categories.map((entry) => [entry.id, entry.label]));
+    if (!core.categoryLabels) for (const line of budget?.allocations ?? []) categories.set(line.categoryId, line.label);
     const rows = summary.categories.filter((entry) => entry.allowance !== null || entry.spent !== 0);
     view.innerHTML = `
       <div class="overview-top">
@@ -341,6 +463,12 @@
     for (const button of view.querySelectorAll('[data-go]')) {
       button.addEventListener('click', () => navigate(button.dataset.go, month, { focusView: true, scroll: true }));
     }
+    for (const button of view.querySelectorAll('[data-category-history]')) {
+      button.addEventListener('click', () => navigate('transactions', month, {
+        transactionFilter: { categoryId: button.dataset.categoryHistory || null, allMonths: false },
+        showFixedCosts: false, focusView: true, scroll: true,
+      }));
+    }
     for (const button of view.querySelectorAll('[data-edit]')) {
       button.addEventListener('click', () => navigate('transactions', month, { transactionId: button.dataset.edit, focusView: true, scroll: true }));
     }
@@ -353,6 +481,7 @@
   function render() {
     editorDraft = false;
     draftIsStale = false;
+    visibleDraftKeys.clear();
     renderTabs();
     renderHeading();
     const notice = get('storage-notice');
@@ -369,7 +498,12 @@
       state: currentState,
       month,
       transactionId,
-      commit: (state, message) => ledger ? save({ ...ledger, state }, message, false, currentState) : false,
+      transactionFilter,
+      setTransactionFilter: (filter) => { transactionFilter = filter; },
+      showFixedCosts,
+      setEntryMode: (fixed) => { showFixedCosts = Boolean(fixed); },
+      drafts: editorDrafts(draftScope(), tab, month),
+      commit: (state, message, options) => ledger ? save({ ...ledger, state }, message, false, currentState, options) : false,
       toast,
       navigate,
     };
@@ -378,15 +512,20 @@
     else if (tab === 'stats') renderStats();
     else if (tab === 'transactions') editors.renderTransactions(context);
     else editors.renderBudget(context);
+    paintDraftNotice();
     if (cloud) paintCloudStatus();
   }
 
   function clearRestoreSelection() {
     restoreRead += 1;
     backupToRestore = undefined;
+    backupPreviewState = undefined;
+    safetyCopyState = undefined;
     get('backup-file').value = '';
     get('restore-notice').hidden = true;
+    get('restore-actions').hidden = true;
     get('restore-backup').hidden = true;
+    get('restore-backup').disabled = true;
   }
 
   function openStorage() {
@@ -417,6 +556,53 @@
     downloadFile(JSON.stringify(data, null, 2), filename, 'application/json');
   }
 
+  function showBackupPreview() {
+    const current = ledger.state;
+    const incoming = backupToRestore.state;
+    backupPreviewState = current;
+    safetyCopyState = undefined;
+    const dates = [...Object.keys(incoming.months), ...incoming.transactions.map(({ date }) => date.slice(0, 7))].sort();
+    const first = dates[0];
+    const last = dates.at(-1);
+    const period = first ? (first === last ? core.monthLabel(first) : `${core.monthLabel(first)} – ${core.monthLabel(last)}`) : 'Ongin mánaður í avritinum';
+    const older = new Map(current.transactions.map((entry) => [entry.id, entry]));
+    const newer = new Map(incoming.transactions.map((entry) => [entry.id, entry]));
+    const removed = current.transactions.filter(({ id }) => !newer.has(id));
+    const added = incoming.transactions.filter(({ id }) => !older.has(id));
+    const changed = incoming.transactions.filter((entry) => {
+      const previous = older.get(entry.id);
+      return previous && ['date', 'categoryId', 'description', 'type', 'amountOre'].some((field) => previous[field] !== entry[field]);
+    });
+    const plans = (state) => Object.values(state.months).filter(({ budget }) => budget).length;
+    const examples = [
+      ...removed.map((entry) => ['Verður strikað', entry]),
+      ...changed.map((entry) => ['Verður broytt', entry]),
+      ...added.map((entry) => ['Verður løgd afturat', entry]),
+    ];
+    const notice = get('restore-notice');
+    notice.innerHTML = `<div class="restore-preview">
+      <strong>${html(period)}</strong>
+      <p>${incoming.transactions.length} skrásetingar og ${plans(incoming)} fíggjarætlanir í avritinum.</p>
+      <p>${added.length} nýggjar · ${changed.length} broyttar · ${removed.length} strikaðar skrásetingar.</p>
+      <p>Fíggjarætlanir: ${plans(current)} → ${plans(incoming)}. Bólkar: ${current.categories.length} → ${incoming.categories.length}.</p>
+      ${examples.length ? `<details><summary>Vís broytingar í skrásetingum</summary><ul>${examples.slice(0, 12).map(([action, entry]) =>
+        `<li>${html(action)} · ${html(entry.date)} · ${html(entry.description)} · ${html(core.money(entry.amountOre))}</li>`).join('')}</ul>${examples.length > 12 ? `<p>Vísir 12 av ${examples.length} broytingum.</p>` : ''}</details>` : ''}
+      <p>Tak fyrst eitt JSON-avrit av verandi dátum. Kanna at fílan er goymd, áðrenn tú setur valda avritið inn.</p>
+    </div>`;
+    notice.hidden = false;
+    get('restore-actions').hidden = false;
+    get('restore-backup').hidden = false;
+    get('restore-backup').disabled = true;
+  }
+
+  function pendingLabel(kind) {
+    return ({ append: 'Nýggj skráseting', edit: 'Broytt skráseting', delete: 'Striking', undo: 'Angra striking' })[kind] ?? 'Skráseting';
+  }
+
+  function pendingRecord(transaction) {
+    return transaction ? `${transaction.date} · ${transaction.description} · ${core.money(transaction.amountOre)}` : 'Skrásetingin er strikað.';
+  }
+
   function paintPendingEntries() {
     const panel = get('cloud-pending-entries');
     const entries = cloudStatus.pendingTransactions ?? [];
@@ -425,20 +611,35 @@
       panel.replaceChildren();
       return;
     }
-    panel.innerHTML = `<h3>Skrásetingar, ið bíða</h3>
-      <button type="button" class="text-button" data-download-pending>Tak bíðandi skrásetingar niður</button>
-      ${entries.filter(({ error }) => error).map(({ operationId, transaction, error }) => `<div class="cloud-pending-problem">
-        <strong>${html(transaction.description)} · ${html(core.money(transaction.amountOre))}</strong><p class="muted">${html(error)}</p>
-        <button class="text-button" type="button" data-discard-pending="${html(operationId)}">Tak úr bíðirøð</button>
+    panel.innerHTML = `<h3>Broytingar, ið bíða</h3>
+      <button type="button" class="text-button" data-download-pending>Tak bíðandi broytingar niður</button>
+      ${entries.filter(({ error }) => error).map((entry) => `<div class="cloud-pending-problem">
+        <strong>${html(pendingLabel(entry.kind))} · ${html(pendingRecord(entry.transaction))}</strong>
+        <p class="muted">${html(entry.error)}</p>
+        ${entry.conflict ? `<p><strong>Samstillað:</strong> ${html(pendingRecord(entry.current))}</p>` : ''}
+        <div class="cloud-actions">
+          ${entry.canKeepMine ? `<button class="button secondary small" type="button" data-keep-pending="${html(entry.operationId)}">Brúka mína broyting</button>` : ''}
+          <button class="text-button" type="button" data-discard-pending="${html(entry.operationId)}">${entry.conflict ? 'Brúka samstilldu dátur' : 'Tak úr bíðirøð'}</button>
+        </div>
       </div>`).join('')}`;
     panel.querySelector('[data-download-pending]').addEventListener('click', () => {
-      downloadJson({ version: 1, transactions: entries.map(({ transaction }) => transaction) }, `figgjaraetlan-bidandi-${core.today()}.json`);
+      downloadJson({ version: 2, transactions: entries.filter(({ kind }) => kind !== 'delete').map(({ transaction }) => transaction), pending: entries }, `figgjaraetlan-bidandi-${core.today()}.json`);
     });
-    for (const button of panel.querySelectorAll('[data-discard-pending]')) {
+    for (const button of panel.querySelectorAll('[data-keep-pending], [data-discard-pending]')) {
       button.addEventListener('click', async () => {
-        if (!window.confirm('Tak fyrst eitt avrit niður. Vilt tú taka hesa skrásetingina úr bíðirøðini?')) return;
-        const result = await cloud.discardPending(button.dataset.discardPending);
-        if (!result.ok) toast(result.message);
+        const keep = button.dataset.keepPending;
+        const operationId = keep ?? button.dataset.discardPending;
+        const entry = entries.find((item) => item.operationId === operationId);
+        if (!keep && !entry?.conflict && !window.confirm('Tak fyrst eitt avrit niður. Vilt tú taka hesa broytingina úr bíðirøðini?')) return;
+        button.disabled = true;
+        try {
+          const result = keep ? await cloud.keepPending(operationId, entry.current) : await cloud.discardPending(operationId);
+          if (!result.ok) toast(result.message);
+        } catch {
+          toast('Broytingin kundi ikki goymast. Royn aftur.');
+        } finally {
+          button.disabled = false;
+        }
       });
     }
   }
@@ -482,6 +683,16 @@
   for (const button of document.querySelectorAll('[data-close-dialog]')) {
     button.addEventListener('click', () => button.closest('dialog').close());
   }
+  get('resume-draft').addEventListener('click', () => {
+    const meta = draftToResume?.[1].meta;
+    if (!meta) return;
+    navigate(meta.tab, meta.month, { transactionId: meta.transactionId, showFixedCosts: meta.showFixedCosts, focusView: true, scroll: true });
+  });
+  get('discard-draft').addEventListener('click', () => {
+    if (!draftToResume || !window.confirm('Vilt tú strika hesa kladduna?')) return;
+    draftStore.discard(draftScope(), draftToResume[0]);
+    paintDraftNotice();
+  });
   get('open-storage').addEventListener('click', openStorage);
   get('footer-storage').addEventListener('click', openStorage);
   get('download-backup').addEventListener('click', () => {
@@ -511,8 +722,7 @@
       if (read !== restoreRead) return;
       if (!validLedger(parsed)) throw new Error('Invalid backup');
       backupToRestore = { mode: parsed.mode, state: parsed.state };
-      notice.textContent = `${parsed.state.transactions.length} skrásetingar í avritinum. Vel knøttin niðanfyri fyri at skifta verandi dátur út.`;
-      get('restore-backup').hidden = false;
+      showBackupPreview();
     } catch {
       if (read !== restoreRead) return;
       notice.textContent = 'Fílan er ikki eitt gilt trygdaravrit fyri Fíggjarætlan.';
@@ -520,8 +730,33 @@
     notice.hidden = false;
   });
   storageDialog.addEventListener('close', clearRestoreSelection);
+  function canRestore() {
+    if (!backupToRestore || !ledger || savingCloud) return false;
+    if (cloudStatus.pending) {
+      toast('Samstilla bíðandi broytingarnar, áðrenn tú setur avritið inn.');
+      return false;
+    }
+    if (ledger.state !== backupPreviewState) {
+      showBackupPreview();
+      toast('Dáturnar eru broyttar. Kanna nýggja yvirlitið.');
+      return false;
+    }
+    return true;
+  }
+  get('download-restore-safety').addEventListener('click', () => {
+    if (!canRestore()) return;
+    try {
+      downloadJson({ ...ledger, exportedAt: new Date().toISOString() }, `figgjaraetlan-adrenn-endurstadan-${core.today()}.json`);
+    } catch {
+      toast('Trygdaravritið kundi ikki takast niður. Royn aftur.');
+      return;
+    }
+    safetyCopyState = ledger.state;
+    get('restore-backup').disabled = false;
+  });
   get('restore-backup').addEventListener('click', async () => {
-    if (backupToRestore && await save(backupToRestore, 'Trygdaravritið er sett inn.', true)) storageDialog.close();
+    if (!canRestore() || ledger.state !== safetyCopyState) return;
+    if (await save(backupToRestore, 'Trygdaravritið er sett inn.', true, backupPreviewState)) storageDialog.close();
   });
   get('switch-ledger').addEventListener('click', () => {
     if (!window.confirm('Verandi dátur verða skiftar út. Vilt tú halda fram?')) return;
@@ -537,12 +772,20 @@
     for (const id of ['cloud-gate-retry', 'cloud-sync-retry']) {
       get(id).addEventListener('click', () => void cloud.retry());
     }
+    get('cloud-review-pending').addEventListener('click', openStorage);
     get('cloud-refresh-draft').addEventListener('click', () => {
-      if (window.confirm('Ógoymdar broytingar í oyðublaðnum hvørva. Vilt tú vísa nýggjastu dáturnar?')) render();
+      render();
     });
     get('cloud-logout').addEventListener('click', async () => {
+      const scope = draftScope();
+      if (draftStore.entries(scope).length && !window.confirm('Kladdur á hesi eindini verða strikaðar, tá ið tú ritar út. Vilt tú halda fram?')) return;
       const result = await cloud.signOut();
       if (!result.ok) toast(result.message);
+      else {
+        draftStore.clear(scope);
+        lastDeletion = undefined;
+        draftStorageUnavailable = false;
+      }
     });
     function trackDraft(event) {
       if (event.target.closest('#transaction-form, [data-budget-form], [data-status-form]')) editorDraft = true;

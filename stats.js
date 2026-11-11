@@ -7,14 +7,21 @@
   const detailPageSize = 20;
   const monthStatuses = { active: 'Virkin', skipped: 'Lopin um' };
   let selection = '3';
+  let includeCurrent = false;
   let customRange;
   let monthPage = 0;
   let selectedCategory;
   let evidenceMonths;
 
+  function activeMonth(state) {
+    const current = core.today().slice(0, 7);
+    return state.months[current]?.status === 'active' ? current : undefined;
+  }
+
   function presetRange(state, length) {
     const current = core.today().slice(0, 7);
-    const end = state.months[current]?.status === 'completed' ? current : core.shiftMonth(current, -1);
+    const end = state.months[current]?.status === 'completed' || (includeCurrent && activeMonth(state))
+      ? current : core.shiftMonth(current, -1);
     return { start: core.shiftMonth(end, 1 - length), end };
   }
 
@@ -34,10 +41,15 @@
   }
 
   function renderControls(root, state, refresh) {
-    root.innerHTML = `<label class="period-control">Tíðarskeið<select id="stats-period">
+    root.innerHTML = `<div class="stats-controls"><label class="period-control">Tíðarskeið<select id="stats-period">
       ${presetLengths.map((length) => `<option value="${length}"${selection === String(length) ? ' selected' : ''}>Seinastu ${length} mánaðir</option>`).join('')}
       <option value="custom"${selection === 'custom' ? ' selected' : ''}>Vel tíðarskeið</option>
-    </select></label>`;
+    </select></label>${activeMonth(state) ? `<label class="check-control"><input type="checkbox" id="stats-include-current" ${includeCurrent ? 'checked' : ''}> ${selection === 'custom' ? 'Tak henda mánaðin við, um hann er í tíðarskeiðinum' : 'Tak henda mánaðin við'}</label>` : ''}</div>`;
+    root.querySelector('#stats-include-current')?.addEventListener('change', ({ target }) => {
+      includeCurrent = target.checked;
+      resetCharts();
+      refresh();
+    });
     root.querySelector('#stats-period').addEventListener('change', ({ target }) => {
       if (target.value === 'custom' && !customRange) customRange = presetRange(state, Number(selection));
       selection = target.value;
@@ -68,17 +80,18 @@
     </form>`;
   }
 
-  function collect(state, range) {
+  function collect(state, range, partialMonth) {
     const months = Object.keys(state.months).filter((key) => range.start <= key && key <= range.end).sort();
-    const transactionsByMonth = new Map(months.filter((key) => state.months[key].status === 'completed').map((key) => [key, []]));
+    const transactionsByMonth = new Map(months.filter((key) => key === partialMonth || state.months[key].status === 'completed').map((key) => [key, []]));
     for (const transaction of state.transactions) {
       transactionsByMonth.get(transaction.date.slice(0, 7))?.push(transaction);
     }
-    const completed = Array.from(transactionsByMonth, ([key, transactions]) => ({
+    const included = Array.from(transactionsByMonth, ([key, transactions]) => ({
       key,
       summary: core.summarize({ ...state, transactions }, key),
     }));
-    const summaries = new Map(completed.map(({ key, summary }) => [key, summary]));
+    const completed = included.filter(({ key }) => key !== partialMonth);
+    const summaries = new Map(included.map(({ key, summary }) => [key, summary]));
     const categories = new Map();
     for (const [key, transactions] of transactionsByMonth) {
       const monthLabels = new Map(summaries.get(key).categories.map((entry) => [entry.categoryId, entry.label]));
@@ -96,7 +109,7 @@
       }
     }
     const categoryRows = Array.from(categories.values()).sort((a, b) => b.spent - a.spent || a.label.localeCompare(b.label, 'fo'));
-    return { months, completed, summaries, categoryRows };
+    return { months, included, completed, summaries, categoryRows };
   }
 
   function chartMonths(state, range, trackedMonths) {
@@ -125,11 +138,11 @@
     return { zero, width, start };
   }
 
-  function renderMonthlyChart(section, rows, completed, summaries, navigate, focus = false) {
+  function renderMonthlyChart(section, rows, included, summaries, navigate, partialMonth, focus = false) {
     const { html, icon } = globalThis.BudgetUI;
     let minimum = 0;
     let maximum = 1;
-    for (const { summary } of completed) {
+    for (const { summary } of included) {
       minimum = Math.min(minimum, summary.spent);
       maximum = Math.max(maximum, summary.recordedIncome, summary.spent);
     }
@@ -143,7 +156,7 @@
     }
     section.innerHTML = `
       <div class="section-heading"><div><p class="section-kicker">Mánað fyri mánað</p><h2 id="stats-monthly-title" tabindex="-1">Inntøkur og útreiðslur</h2></div></div>
-      <p class="muted">Trýst á ein lidnan mánað fyri at síggja skrásetingarnar.</p>
+      <p class="muted">Trýst á ein mánað við tølum fyri at síggja skrásetingarnar.</p>
       <div class="chart-legend"><span><i class="legend-dot income"></i> Inntøkur</span><span><i class="legend-dot expense"></i> Útreiðslur</span></div>
       <div class="chart-rows">${visible.map(({ key, status, gap }) => {
         const label = html(gap ? rangeLabel(gap) : core.monthLabel(key));
@@ -154,8 +167,9 @@
         }
         const income = summary.hasRecordedIncome ? html(core.money(summary.recordedIncome)) : '—';
         const expenses = html(core.money(summary.spent));
-        return `<button type="button" class="chart-row" data-chart-month="${key}" aria-label="${label}. Inntøkur ${income}. Útreiðslur ${expenses}. Vís skrásetingar.">
-          <span class="chart-label">${label}</span>
+        const partial = key === partialMonth;
+        return `<button type="button" class="chart-row" data-chart-month="${key}" aria-label="${label}${partial ? ' higartil' : ''}. Inntøkur ${income}. Útreiðslur ${expenses}. Vís skrásetingar.">
+          <span class="chart-label">${label}${partial ? '<small class="chart-partial">Higartil</small>' : ''}</span>
           <span class="chart-tracks" aria-hidden="true">${bar(summary.recordedIncome, 'income')}${bar(summary.spent, 'expense')}</span>
           <span class="chart-value"><span>${income}</span><span>${expenses}</span></span>
         </button>`;
@@ -171,18 +185,18 @@
     for (const button of section.querySelectorAll('[data-chart-page]')) {
       button.addEventListener('click', () => {
         monthPage += button.dataset.chartPage === 'older' ? 1 : -1;
-        renderMonthlyChart(section, rows, completed, summaries, navigate, true);
+        renderMonthlyChart(section, rows, included, summaries, navigate, partialMonth, true);
       });
     }
     if (focus) section.querySelector('#stats-monthly-title').focus({ preventScroll: true });
   }
 
-  function categoryChart(categories) {
+  function categoryChart(categories, partialMonth) {
     const { html, icon } = globalThis.BudgetUI;
     const maximum = categories.reduce((max, category) => Math.max(max, category.spent), 1);
     const minimum = categories.reduce((min, category) => Math.min(min, category.spent), 0);
     return `<section class="card category-stats-chart" aria-labelledby="stats-category-title">
-      <div class="section-heading"><div><p class="section-kicker">Lidnir mánaðir</p><h2 id="stats-category-title">Nýtsla eftir bólki</h2></div></div>
+      <div class="section-heading"><div><p class="section-kicker">${partialMonth ? 'Við hesum mánaðinum higartil' : 'Lidnir mánaðir'}</p><h2 id="stats-category-title">Nýtsla eftir bólki</h2></div></div>
       ${categories.length ? `<p class="muted">Útreiðslur eftir endurgjøld. Trýst á ein bólk fyri at síggja skrásetingarnar.</p>
         <div class="stats-category-list">${categories.map((category, index) => {
           const { zero, width, start } = barPosition(category.spent, minimum, maximum);
@@ -191,7 +205,7 @@
             <span class="stats-category-value">${html(core.money(category.spent))} ${icon('chevron-right')}</span>
             <span class="stats-category-track" style="--chart-zero:${zero}%" aria-hidden="true"><span class="stats-category-bar" style="width:${width}%;margin-inline-start:${start}%"></span></span>
           </button>`;
-        }).join('')}</div>` : '<p class="empty-state">Ongar útreiðslur eru skrásettar í lidnum mánaðum í hesum tíðarskeiði.</p>'}
+        }).join('')}</div>` : '<p class="empty-state">Ongar útreiðslur eru skrásettar í mánaðunum, ið telja við.</p>'}
       <div class="stats-detail" id="stats-category-detail" hidden></div>
     </section>`;
   }
@@ -289,25 +303,28 @@
     const { html } = globalThis.BudgetUI;
     const range = selection === 'custom' ? customRange : presetRange(state, Number(selection));
     const count = monthCount(range.start, range.end);
-    const { months, completed, summaries, categoryRows } = collect(state, range);
-    const incomeComplete = completed.length > 0 && completed.every(({ summary }) => summary.hasRecordedIncome);
-    const income = completed.reduce((sum, { summary }) => sum + summary.recordedIncome, 0);
-    const spent = completed.reduce((sum, { summary }) => sum + summary.spent, 0);
+    const active = activeMonth(state);
+    const partialMonth = includeCurrent && active && range.start <= active && active <= range.end ? active : undefined;
+    const { months, included, completed, summaries, categoryRows } = collect(state, range, partialMonth);
+    const incomeComplete = included.length > 0 && included.every(({ summary }) => summary.hasRecordedIncome);
+    const income = included.reduce((sum, { summary }) => sum + summary.recordedIncome, 0);
+    const spent = included.reduce((sum, { summary }) => sum + summary.spent, 0);
+    const completedSpent = completed.reduce((sum, { summary }) => sum + summary.spent, 0);
     const insights = globalThis.BudgetInsights.generate(completed, range);
 
     root.innerHTML = `<div class="stats-page">
       ${selection === 'custom' ? rangeForm(range) : ''}
-      <p class="stats-coverage" tabindex="-1"><strong>${html(rangeLabel(range))}</strong> <span>${completed.length} av ${count} lidnir mánaðir</span></p>
+      <p class="stats-coverage" tabindex="-1"><strong>${html(rangeLabel(range))}</strong> <span>${completed.length} av ${count} lidnir mánaðir${partialMonth ? ' · hesin mánaður higartil' : ''}</span></p>
       <div class="stats-top metrics-grid">
         ${metric('Skrásettar inntøkur', incomeComplete ? income : null)}
-        ${metric('Skrásettar útreiðslur', completed.length ? spent : null)}
-        ${metric('Miðal útreiðslur', completed.length ? Math.round(spent / completed.length) : null)}
+        ${metric('Skrásettar útreiðslur', included.length ? spent : null)}
+        ${metric('Miðal útreiðslur', completed.length ? Math.round(completedSpent / completed.length) : null)}
         ${metric('Skrásettur munur', incomeComplete ? income - spent : null)}
       </div>
       ${insightsMarkup(insights, categoryRows, completed.length)}
       <section class="card stats-chart" aria-labelledby="stats-monthly-title"></section>
-      ${categoryChart(categoryRows)}
-      <p class="stats-footnote muted">Einans lidnir mánaðir telja við. Eru inntøkur ikki skrásettar í einum lidnum mánaði, verða samlaða inntøkan og munurin víst sum ein strika.</p>
+      ${categoryChart(categoryRows, partialMonth)}
+      <p class="stats-footnote muted">${partialMonth ? 'Hesin mánaður telur við higartil. Miðaltøl og eygleiðingar brúka bert lidnar mánaðir.' : 'Einans lidnir mánaðir telja við.'} Eru inntøkur ikki skrásettar í einum mánaði, ið telur við, verða samlaða inntøkan og munurin víst sum ein strika.</p>
     </div>`;
 
     root.querySelector('#stats-range-form')?.addEventListener('submit', (event) => {
@@ -327,7 +344,7 @@
       render({ root, state, navigate, metric });
       root.querySelector('.stats-coverage').focus({ preventScroll: true });
     });
-    renderMonthlyChart(root.querySelector('.stats-chart'), chartMonths(state, range, months), completed, summaries, navigate);
+    renderMonthlyChart(root.querySelector('.stats-chart'), chartMonths(state, range, months), included, summaries, navigate, partialMonth);
     attachDrilldown(root, categoryRows, navigate);
   }
 

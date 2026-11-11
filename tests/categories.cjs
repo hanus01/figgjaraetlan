@@ -107,7 +107,7 @@ test('A saved new budget category appears alphabetically in entry and filter bef
   assert.equal(purchase.categoryId, booksId);
   assert.equal(purchase.amountOre, 12550);
   click('#tab-overview');
-  const overview = app.document.querySelectorAll('.category-row').find(row => row.querySelector('.category-name').textContent === 'Bøkur');
+  const overview = app.document.querySelectorAll('.category-row').find(row => row.querySelector('.category-name').textContent.trim() === 'Bøkur');
   assert(overview);
   assert(overview.textContent.includes(app.context.BudgetCore.money(37450)));
   assert(overview.textContent.includes(app.context.BudgetCore.money(12550)));
@@ -210,7 +210,7 @@ test('Removing a monthly allowance keeps catalog/history readable and the catego
   sorted(get('#transaction-form').elements.category);
   sorted(get('[data-filter-category]'));
   click('#tab-overview');
-  const row = app.document.querySelectorAll('.category-row').find(item => item.querySelector('.category-name').textContent === 'Bøkur');
+  const row = app.document.querySelectorAll('.category-row').find(item => item.querySelector('.category-name').textContent.trim() === 'Bøkur');
   assert(row);
   assert(row.textContent.includes('Ongin játtan'));
 });
@@ -249,4 +249,126 @@ test('Removing and readding a renamed snapshot line reuses its category ID', () 
   assert.equal(saved.months['2026-11'].budget.allocations.find(line => line.label === 'Dagligvørur').categoryId, 'food');
 });
 
-console.log(`Passed ${checked.length} normal-entry category regression cases.`);
+test('All-month search combines date, category and transaction type filters and edits an older result in place', () => {
+  const target = loadApp(source, fixture());
+  target.click('#tab-transactions');
+  assert.equal(editButton(target, 'old-food'), undefined);
+  target.change('[data-filter-scope]', 'all');
+  target.change('[data-filter-from]', '2026-10-01');
+  target.change('[data-filter-to]', '2026-10-31');
+  target.change('[data-filter-type]', 'expense');
+  target.change('[data-filter-category]', 'food');
+  type(target.get('[data-search]'), 'gamalt');
+  assert(editButton(target, 'old-food'));
+  assert.equal(editButton(target, 'legacy-book-purchase'), undefined);
+  assert.equal(editButton(target, 'orphan-purchase'), undefined);
+  editButton(target, 'old-food').click();
+  const form = target.get('#transaction-form');
+  assert.equal(form.elements.date.value, '2026-10-15');
+  type(form.elements.amount, '31,50');
+  form.requestSubmit();
+  assert.equal(target.ledger().state.transactions.find(item => item.id === 'old-food').amountOre, 3150);
+  assert.equal(target.get('[data-filter-scope]').value, 'all');
+  assert.equal(target.get('[data-filter-category]').value, 'food');
+  assert(editButton(target, 'old-food'));
+});
+
+test('Overview category opens matching records for the selected month', () => {
+  const target = loadApp(source, fixture());
+  target.click('[data-category-history="phone"]');
+  assert.equal(target.get('[data-filter-category]').value, 'phone');
+  assert(editButton(target, 'phone-purchase'));
+  assert.equal(editButton(target, 'orphan-purchase'), undefined);
+});
+
+test('Fixed-cost entry opens a prefilled draft, records only on Save and prevents a second shortcut entry', () => {
+  const ledger = fixture();
+  const rent = { id: 'rent', label: 'Húsaleiga', kind: 'fixed' };
+  ledger.state.categories.push(rent);
+  ledger.state.months['2026-11'].budget.allocations.push({ categoryId: rent.id, label: rent.label, kind: rent.kind, amountOre: 600000 });
+  const target = loadApp(source, ledger);
+  target.click('#tab-budget');
+  target.click('[data-open-fixed-entry]');
+  assert.equal(target.get('[data-entry-mode="fixed"]').getAttribute('aria-pressed'), 'true');
+  assert.equal(target.get('[data-add-fixed="phone"]').disabled, true);
+  target.click('[data-add-fixed="rent"]');
+  let form = target.get('#transaction-form');
+  assert.equal(form.hidden, false);
+  assert.equal(form.elements.category.value, 'rent');
+  assert.equal(form.elements.description.value, 'Húsaleiga');
+  assert.equal(form.elements.amount.value, '6000');
+  assert.equal(target.ledger().state.transactions.length, ledger.state.transactions.length);
+  target.click('[data-entry-mode="regular"]');
+  assert.equal(target.get('#transaction-form').elements.amount.value, '');
+  type(target.get('#transaction-form').elements.description, 'Vanlig óliðug skráseting');
+  target.click('[data-entry-mode="fixed"]');
+  form = target.get('#transaction-form');
+  assert.equal(form.elements.amount.value, '6000');
+  form.requestSubmit();
+  const entries = target.ledger().state.transactions.filter(item => item.categoryId === 'rent');
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].amountOre, 600000);
+  assert.equal(entries[0].date, '2026-11-10');
+  assert.equal(target.get('[data-add-fixed="rent"]').disabled, true);
+  target.click('[data-entry-mode="regular"]');
+  assert.equal(target.get('#transaction-form').elements.description.value, 'Vanlig óliðug skráseting');
+});
+
+test('Category management renames future copies and hides archived items from new entry without altering history', () => {
+  const ledger = fixture();
+  const target = loadApp(source, ledger);
+  target.click('#tab-budget');
+  target.click('[data-open-category-manager]');
+  type(target.get('[data-managed-category="food"] [data-managed-label]'), 'Dagligvørur');
+  target.click('[data-managed-category="phone"] [data-toggle-archive]');
+  target.get('[data-category-form]').requestSubmit();
+  const saved = target.ledger().state;
+  assert.equal(saved.categories.find(category => category.id === 'phone').archived, true);
+  assert.deepEqual(saved.categories.find(category => category.id === 'food').renames, [{ from: '2026-12', label: 'Dagligvørur' }]);
+  assert.deepEqual(saved.months, ledger.state.months);
+  assert.deepEqual(saved.transactions, ledger.state.transactions);
+  const next = target.context.BudgetCore.createBudget(saved, '2026-12');
+  assert.equal(next.allocations.find(line => line.categoryId === 'food').label, 'Dagligvørur');
+  assert.equal(next.allocations.some(line => line.categoryId === 'phone'), false);
+  const existingDecember = { ...saved, months: { ...saved.months,
+    '2026-12': { status: 'active', budget: ledger.state.months['2026-11'].budget } } };
+  assert.equal(target.context.BudgetCore.createBudget(existingDecember, '2027-01').allocations
+    .find(line => line.categoryId === 'food').label, 'Dagligvørur');
+  target.click('#tab-transactions');
+  assert(!options(target.get('#transaction-form').elements.category).some(option => option.id === 'phone'));
+  assert(options(target.get('[data-filter-category]')).some(option => option.id === 'phone'));
+  editButton(target, 'phone-purchase').click();
+  assert.equal(target.get('#transaction-form').elements.category.value, 'phone');
+});
+
+test('Month review completes the current month and prepares an independent next budget', () => {
+  const ledger = fixture();
+  const target = loadApp(source, ledger);
+  target.click('#tab-budget');
+  target.click('[data-open-month-review]');
+  assert(target.get('[data-month-review]').hasAttribute('open'));
+  target.click('[data-complete-month]');
+  const saved = target.ledger().state;
+  assert.equal(saved.months['2026-11'].status, 'completed');
+  assert.deepEqual(saved.months['2026-11'].budget, ledger.state.months['2026-11'].budget);
+  assert.deepEqual(saved.months['2026-12'].budget, { ...ledger.state.months['2026-11'].budget, copiedFrom: '2026-11' });
+  assert(target.get('#open-month').textContent.includes('Desember 2026'));
+});
+
+test('An unfinished budget line survives changing tabs without changing the saved plan', () => {
+  const ledger = fixture();
+  const target = loadApp(source, ledger);
+  target.click('#tab-budget');
+  target.click('[data-add-budget-line="fixed"]');
+  let row = target.get('[data-budget-lines="fixed"]').lastElementChild;
+  type(row.querySelector('[data-line-label]'), 'Ógoymt hald');
+  type(row.querySelector('[data-line-amount]'), '199,50');
+  target.click('#tab-overview');
+  target.click('#tab-budget');
+  row = target.get('[data-budget-lines="fixed"]').lastElementChild;
+  assert.equal(row.querySelector('[data-line-label]').value, 'Ógoymt hald');
+  assert.equal(row.querySelector('[data-line-amount]').value, '199,50');
+  assert.deepEqual(target.ledger().state.months['2026-11'].budget, ledger.state.months['2026-11'].budget);
+});
+
+console.log(`Passed ${checked.length} category and editor regression cases.`);

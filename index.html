@@ -11,6 +11,7 @@
     <script defer src="stats-insights.js"></script>
     <script defer src="stats.js"></script>
     <script defer src="csv-export.js"></script>
+    <script defer src="draft-store.js"></script>
     <script defer src="app.js"></script>
   </head>
   <body>
@@ -59,7 +60,15 @@
           <div class="cloud-actions">
             <a class="text-button" id="cloud-reconnect" href="/auth/login" hidden>Rita inn</a>
             <button class="text-button" id="cloud-sync-retry" type="button" hidden>Royn aftur</button>
+            <button class="text-button" id="cloud-review-pending" type="button" hidden>Kanna bíðandi broytingar</button>
             <button class="text-button" id="cloud-refresh-draft" type="button" hidden>Vís nýggjastu dátur</button>
+          </div>
+        </section>
+        <section class="notice draft-notice" id="draft-notice" hidden aria-label="Kladdur">
+          <p id="draft-message"></p>
+          <div class="cloud-actions">
+            <button class="text-button" type="button" id="resume-draft">Halt fram</button>
+            <button class="text-button" type="button" id="discard-draft">Strika kladdu</button>
           </div>
         </section>
         <section id="view" role="tabpanel" tabindex="0"></section>
@@ -105,8 +114,11 @@
           <button type="button" class="button secondary" id="download-transactions-csv">Skrásetingar (CSV)</button>
           <button type="button" class="button secondary" id="download-budgets-csv">Fíggjarætlanir (CSV)</button>
         </div>
-        <p id="restore-notice" role="status" hidden></p>
-        <button type="button" class="button primary" id="restore-backup" hidden>Set valda avrit inn</button>
+        <div id="restore-notice" role="status" hidden></div>
+        <div class="dialog-actions" id="restore-actions" hidden>
+          <button type="button" class="button secondary" id="download-restore-safety">Tak avrit av verandi dátum</button>
+          <button type="button" class="button primary" id="restore-backup" hidden disabled>Set valda avrit inn</button>
+        </div>
         <button type="button" class="text-button" id="switch-ledger"></button>
         <section id="cloud-pending-entries" class="cloud-pending-entries" hidden></section>
         <button type="button" class="text-button" id="cloud-logout" hidden>Rita út</button>

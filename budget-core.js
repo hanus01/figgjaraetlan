@@ -96,23 +96,42 @@
       .at(-1) ?? null;
   }
 
+  function categoryLabel(category, month) {
+    if (!category) return undefined;
+    return category.renames?.findLast(rename => rename.from <= month)?.label ?? category.label;
+  }
+
+  function categoryLabels(state, month) {
+    const names = new Map(state.categories.map(category => [category.id, categoryLabel(category, month)]));
+    for (const line of state.months[month]?.budget?.allocations ?? []) names.set(line.categoryId, line.label);
+    return names;
+  }
+
   function createBudget(state, month, sourceMonth = sourceForBudget(state, month)) {
     const source = isMonth(sourceMonth) && sourceMonth < month
       ? state.months[sourceMonth]?.budget
       : null;
 
     if (source) {
+      const catalog = new Map(state.categories.map(category => [category.id, category]));
+      const allocations = [];
+      for (const line of source.allocations) {
+        const category = catalog.get(line.categoryId);
+        if (category?.archived) continue;
+        const renamed = category?.renames?.some(rename => rename.from <= month);
+        allocations.push({ ...line, label: renamed ? categoryLabel(category, month) : line.label });
+      }
       return {
         income: source.income.map((line) => ({ ...line })),
-        allocations: source.allocations.map((line) => ({ ...line })),
+        allocations,
         copiedFrom: sourceMonth
       };
     }
 
     return {
       income: [],
-      allocations: state.categories.map(({ id, label, kind }) => ({
-        categoryId: id, label, kind, amountOre: 0
+      allocations: state.categories.filter(category => !category.archived).map(category => ({
+        categoryId: category.id, label: categoryLabel(category, month), kind: category.kind, amountOre: 0
       })),
       copiedFrom: null
     };
@@ -158,7 +177,7 @@
         const definition = catalog.get(categoryId);
         category = {
           categoryId,
-          label: definition?.label ?? "Óbólkað",
+          label: categoryLabel(definition, month) ?? "Óbólkað",
           kind: definition?.kind ?? "variable",
           allowance: null,
           spent: 0
@@ -216,12 +235,21 @@
       hasUniqueValues(budget.allocations, "categoryId");
   }
 
+  function validCategory(category) {
+    if (!isRecord(category) || !isText(category.id) || !isText(category.label) || !isKind(category.kind)) return false;
+    if (category.archived !== undefined && category.archived !== true) return false;
+    if (category.renames === undefined) return true;
+    return Array.isArray(category.renames) && category.renames.length <= 120 &&
+      category.renames.every((rename, index, renames) =>
+        isRecord(rename) && isMonth(rename.from) && isText(rename.label) && rename.label.length <= 60 &&
+        (index === 0 || renames[index - 1].from < rename.from));
+  }
+
   function validateState(state) {
     return isRecord(state) &&
       state.version === 1 &&
       Array.isArray(state.categories) &&
-      state.categories.every((category) =>
-        isRecord(category) && isText(category.id) && isText(category.label) && isKind(category.kind)) &&
+      state.categories.every(validCategory) &&
       hasUniqueValues(state.categories, "id") &&
       isRecord(state.months) &&
       Object.entries(state.months).every(([key, month]) =>
@@ -310,6 +338,6 @@
 
   globalThis.BudgetCore = {
     today, isMonth, isDate, shiftMonth, monthLabel, money, parseAmount, newId,
-    seedState, summarize, sourceForBudget, createBudget, validateState
+    seedState, summarize, sourceForBudget, createBudget, categoryLabel, categoryLabels, validateState
   };
 })();

@@ -27,38 +27,47 @@
   }
 
   function transactions(state, { pendingEntries = [], synced = false } = {}) {
-    const pendingById = new Map(pendingEntries.map((entry) => [entry.transaction.id, entry]));
+    const pendingById = new Map();
+    for (const entry of pendingEntries) {
+      const id = entry.transaction?.id;
+      if (id && !pendingById.get(id)?.error) pendingById.set(id, entry);
+    }
+    const pendingStatus = (entry) => entry.error ? 'needs_attention'
+      : ({ edit: 'pending_edit', delete: 'pending_delete', undo: 'pending_undo' })[entry.kind] ?? 'pending';
     const recordsById = new Map(state.transactions.map((entry) => [entry.id, entry]));
     const records = state.transactions.map((transaction) => {
       const pending = pendingById.get(transaction.id);
-      const waiting = pending && sameTransaction(transaction, pending.transaction);
+      const waiting = pending && pending.kind !== 'delete' && sameTransaction(transaction, pending.transaction);
       return {
         transaction,
-        status: waiting ? (pending.error ? 'needs_attention' : 'pending') : (synced ? 'synced' : 'local'),
+        status: waiting ? pendingStatus(pending) : (synced ? 'synced' : 'local'),
         error: waiting ? pending.error : '',
       };
     });
-    for (const pending of pendingEntries) {
+    for (const pending of pendingById.values()) {
       const existing = recordsById.get(pending.transaction.id);
-      if (existing && sameTransaction(existing, pending.transaction)) continue;
+      if (pending.kind !== 'delete' && existing && sameTransaction(existing, pending.transaction)) continue;
       records.push({
         transaction: pending.transaction,
-        status: pending.error ? 'needs_attention' : 'pending',
+        status: pendingStatus(pending),
+        proposed: pending.kind === 'delete' || (['edit', 'undo'].includes(pending.kind) && Boolean(existing)),
         error: pending.error ?? '',
       });
     }
     records.sort((a, b) => a.transaction.date.localeCompare(b.transaction.date)
       || a.transaction.id.localeCompare(b.transaction.id));
-    const categories = new Map(state.categories.map((entry) => [entry.id, entry.label]));
+    const core = globalThis.BudgetCore;
+    const categories = new Map(state.categories.map((entry) => [entry.id, entry]));
     const rows = [[
       'transaction_id', 'date', 'month', 'type', 'description', 'category_id', 'category',
       'amount_ore', 'amount_dkk', 'net_expense_dkk', 'month_status', 'sync_status', 'sync_error',
     ]];
-    for (const { transaction, status, error } of records) {
+    for (const { transaction, status, error, proposed } of records) {
       const key = transaction.date.slice(0, 7);
       const month = state.months[key];
       const planned = month?.budget?.allocations.find((line) => line.categoryId === transaction.categoryId);
-      let category = planned?.label ?? categories.get(transaction.categoryId) ?? 'Óbólkað';
+      const definition = categories.get(transaction.categoryId);
+      let category = planned?.label ?? (definition && (core?.categoryLabel?.(definition, key) ?? definition.label)) ?? 'Óbólkað';
       let netExpense = transaction.amountOre;
       if (transaction.type === 'income') {
         category = 'Inntøka';
@@ -67,7 +76,7 @@
       rows.push([
         text(transaction.id), transaction.date, key, transaction.type, text(transaction.description),
         text(transaction.categoryId), text(category), transaction.amountOre, amount(transaction.amountOre),
-        amount(netExpense), month?.status ?? 'untracked', status, text(error),
+        amount(proposed ? 0 : netExpense), month?.status ?? 'untracked', status, text(error),
       ]);
     }
     return encode(rows);

@@ -8,10 +8,10 @@ const coreCode = fs.readFileSync(path.join(source, "budget-core.js"), "utf8");
 const syncCode = fs.readFileSync(path.join(source, "cloud", "sync.js"), "utf8");
 const clone = structuredClone;
 
-function fakeIndexedDB() {
+function fakeIndexedDB(legacyRecord = null) {
   let queue = Promise.resolve();
-  let created = false;
-  let record = null;
+  let version = legacyRecord ? 1 : 0;
+  let record = clone(legacyRecord);
   let storageFail = false;
   const database = {
     createObjectStore() {},
@@ -49,10 +49,14 @@ function fakeIndexedDB() {
     },
   };
   return {
-    open() {
+    open(_name, requestedVersion) {
+      assert.equal(requestedVersion, 2);
       const request = { result: database };
       setImmediate(() => {
-        if (!created) { request.onupgradeneeded(); created = true; }
+        if (requestedVersion > version) {
+          request.onupgradeneeded({ oldVersion: version });
+          version = requestedVersion;
+        }
         request.onsuccess();
       });
       return request;
@@ -71,6 +75,7 @@ function createServer() {
     configured: true,
     calls: [],
     receipts: new Set(),
+    rowOperations: new Map(),
     lostResponse: false,
     rejectAppend: null,
     pauseSession: undefined,
@@ -109,16 +114,41 @@ function createServer() {
     if (server.receipts.has(operation.operationId)) return snapshot();
     if (operation.type === "append") {
       if (server.rejectAppend) return response(server.rejectAppend.status, { code: server.rejectAppend.code });
-      server.state.transactions.push(operation.transaction);
-      server.state.months[operation.transaction.date.slice(0, 7)] ??= { status: "active", budget: null };
-    } else {
-      assert.equal(operation.type, "patch");
-      if (operation.baseRevision !== server.revision) return response(409, { code: "conflict" });
-      assert.deepEqual(operation.changes.categories, { upsert: [], remove: [] });
-      assert.deepEqual(operation.changes.months, { upsert: [], remove: [] });
-      for (const item of operation.changes.transactions.upsert) {
-        server.state.transactions = server.state.transactions.map(old => old.id === item.id ? item : old);
+      const { transaction, operationId } = operation;
+      if (operation.fixedCost && server.state.transactions.some(item => item.type === "expense"
+        && item.categoryId === transaction.categoryId && item.date.slice(0, 7) === transaction.date.slice(0, 7))) {
+        return response(409, { code: "fixedAlreadyRecorded", revision: server.revision, state: server.state });
       }
+      server.state.transactions.push(transaction);
+      server.rowOperations.set(transaction.id, operationId);
+      server.state.months[transaction.date.slice(0, 7)] ??= { status: "active", budget: null };
+    } else if (operation.type === "correction") {
+      const { before, after, undoOf, operationId } = operation;
+      const { id } = before ?? after;
+      const index = server.state.transactions.findIndex(item => item.id === id);
+      const current = server.state.transactions[index] ?? null;
+      if (JSON.stringify(before) !== JSON.stringify(current)
+        || (before === null && server.rowOperations.get(id) !== undoOf)) {
+        return response(409, { code: "conflict", revision: server.revision, state: server.state });
+      }
+      if (after) {
+        if (index < 0) server.state.transactions.push(after);
+        else server.state.transactions[index] = after;
+        server.state.months[after.date.slice(0, 7)] ??= { status: "active", budget: null };
+      } else server.state.transactions.splice(index, 1);
+      server.rowOperations.set(id, operationId);
+    } else {
+      assert.ok(["patch", "restore"].includes(operation.type));
+      if (operation.baseRevision !== server.revision) return response(409, { code: "conflict" });
+      for (const kind of ["categories", "transactions"]) {
+        const group = operation.changes[kind];
+        const rows = new Map(server.state[kind].map(item => [item.id, item]));
+        for (const id of group.remove) rows.delete(id);
+        for (const item of group.upsert) rows.set(item.id, item);
+        server.state[kind] = [...rows.values()];
+      }
+      for (const key of operation.changes.months.remove) delete server.state.months[key];
+      for (const { key, value } of operation.changes.months.upsert) server.state.months[key] = value;
     }
     server.revision++;
     server.receipts.add(operation.operationId);
@@ -137,7 +167,7 @@ function browser(server, indexedDB, online = true) {
   const navigator = { onLine: online };
   const states = [];
   const context = vm.createContext({
-    indexedDB, navigator, fetch: server.fetch, AbortController, TypeError, console,
+    indexedDB, navigator, fetch: server.fetch, AbortController, TextEncoder, TypeError, console,
     setTimeout, clearTimeout, setInterval() {},
     document: { hidden: false, addEventListener() {} },
     addEventListener(name, listener) { events.set(name, listener); },
@@ -156,11 +186,23 @@ function makeTransaction(id, amountOre = 12550) {
   return { id, date: "2026-11-01", description: "Bónus", categoryId: "food", type: "expense", amountOre };
 }
 
-function add(browser, item, state = browser.snapshot().state) {
+function add(browser, item, state = browser.snapshot().state, options = {}) {
   return browser.instance.save({
     ...state,
     months: { ...state.months, "2026-11": state.months["2026-11"] ?? { status: "active", budget: null } },
     transactions: [...state.transactions, item],
+  }, { expectedState: state, ...options });
+}
+
+function edit(browser, id, changes, state = browser.snapshot().state) {
+  return browser.instance.save({
+    ...state, transactions: state.transactions.map(item => item.id === id ? { ...item, ...changes } : item),
+  }, { expectedState: state });
+}
+
+function remove(browser, id, state = browser.snapshot().state) {
+  return browser.instance.save({
+    ...state, transactions: state.transactions.filter(item => item.id !== id),
   }, { expectedState: state });
 }
 
@@ -170,6 +212,7 @@ async function run() {
   const a = browser(server, idb);
   await a.instance.start();
   assert.equal(a.snapshot().phase, "synced");
+  assert.equal(a.snapshot().ownerId, "123");
   const pristine = a.snapshot().state;
   await a.instance.retry();
   assert.equal(a.snapshot().state, pristine);
@@ -212,7 +255,11 @@ async function run() {
   console.log("PASS lost append response retries with stable ID and no duplicated purchase");
 
   let expected = b.snapshot().state;
-  let changed = { ...expected, transactions: expected.transactions.map(item => ({ ...item, amountOre: 20000 })) };
+  let changed = {
+    ...expected,
+    months: { ...expected.months, "2026-11": { status: "completed", budget: null } },
+    transactions: expected.transactions.map(item => ({ ...item, amountOre: 20000 })),
+  };
   server.revision++;
   server.state.transactions.push(makeTransaction("remote", 2000));
   assert.equal((await b.instance.save(changed, { expectedState: expected })).ok, false);
@@ -228,6 +275,7 @@ async function run() {
   expected = b.snapshot().state;
   changed = { ...expected, transactions: expected.transactions.map(item => item.id === first.id ? { ...item, amountOre: 20000 } : item) };
   assert.equal((await b.instance.save(changed, { expectedState: expected })).ok, true);
+  await b.instance.retry();
   assert.equal(server.state.transactions[0].amountOre, 20000);
   assert.equal(server.state.transactions.length, 2);
   console.log("PASS concurrent revision rejects stale patch durably; fresh editor patch succeeds");
@@ -268,7 +316,7 @@ async function run() {
   assert.equal(c.snapshot().pending, 0);
   assert.equal(server.state.transactions.at(-1).id, "blocked");
   assert.ok(server.receipts.has(blockedOperation));
-  console.log("PASS offline edits rejected, failed IDB write never acknowledged, durable blocked op retried while a refresh was active");
+  console.log("PASS offline multi-record replacement rejected, failed IDB write never acknowledged, blocked append can retry");
 
   c.online(false);
   c.events.get("offline")();
@@ -331,6 +379,7 @@ async function run() {
   g.online(true);
   await g.instance.retry();
   assert.equal(g.snapshot().state, null);
+  assert.equal(g.snapshot().ownerId, undefined);
   assert.equal(g.snapshot().pendingTransactions.length, 0);
   assert.equal(staleDb.getRecord().outbox[0].transaction.id, "owner-secret");
   assert.equal(staleServer.state.transactions.length, 4);
@@ -364,6 +413,171 @@ async function run() {
   assert.equal(k.snapshot().pending, 0);
   assert.equal(authServer.state.transactions[0].id, "renew-session");
   console.log("PASS expired session hides cached data and retains pending record until same owner signs in again");
+
+  const correctionServer = createServer();
+  correctionServer.state.transactions = [makeTransaction("edit-me"), makeTransaction("delete-me")];
+  correctionServer.state.months["2026-11"] = { status: "active", budget: null };
+  const correctionDb = fakeIndexedDB();
+  const l = browser(correctionServer, correctionDb);
+  await l.instance.start();
+  l.online(false);
+  l.events.get("offline")();
+  assert.equal((await edit(l, "edit-me", { amountOre: 75125 })).ok, true);
+  const deletion = await remove(l, "delete-me");
+  assert.equal(deletion.ok, true);
+  assert.equal(l.snapshot().state.transactions.length, 1);
+  assert.deepEqual(Array.from(l.snapshot().pendingTransactions, entry => entry.kind), ["edit", "delete"]);
+  assert.equal(l.snapshot().pendingTransactions[1].transaction.id, "delete-me");
+  assert.equal(l.snapshot().ownerId, "123");
+
+  const m = browser(correctionServer, correctionDb, false);
+  await m.instance.start();
+  assert.equal(m.snapshot().state.transactions[0].amountOre, 75125);
+  assert.equal(m.snapshot().state.transactions.length, 1);
+  correctionServer.revision++;
+  correctionServer.state.transactions.push(makeTransaction("unrelated-remote"));
+  m.online(true);
+  correctionServer.lostResponse = true;
+  await m.instance.retry();
+  assert.equal(m.snapshot().pending, 2);
+  assert.equal(correctionServer.state.transactions.find(item => item.id === "edit-me").amountOre, 75125);
+  await m.instance.retry();
+  assert.equal(m.snapshot().phase, "synced");
+  assert.deepEqual(correctionServer.state.transactions.map(item => item.id), ["edit-me", "unrelated-remote"]);
+  const attempts = correctionServer.calls.filter(call => call.operation?.before?.id === "edit-me");
+  assert.equal(attempts.length, 2);
+  assert.deepEqual(attempts[0].operation, attempts[1].operation);
+
+  l.online(false);
+  await l.instance.retry();
+  assert.equal((await l.instance.undoDelete(deletion.operationId)).ok, true);
+  assert.equal(l.snapshot().state.transactions.find(item => item.id === "delete-me").amountOre, 12550);
+  assert.equal((await l.instance.undoDelete(deletion.operationId)).ok, false);
+  l.online(true);
+  await l.instance.retry();
+  assert.equal(correctionServer.state.transactions.filter(item => item.id === "delete-me").length, 1);
+  assert.equal((await l.instance.undoDelete("unknown-delete")).ok, false);
+  console.log("PASS offline corrections survive restart, retry exactly once, merge with unrelated changes, and undo a synced deletion");
+
+  l.online(false);
+  l.events.get("offline")();
+  const pendingFixed = { ...makeTransaction("pending-fixed", 2999), categoryId: "rent" };
+  assert.equal((await add(l, pendingFixed, l.snapshot().state, { fixedCost: true })).ok, true);
+  assert.equal((await edit(l, pendingFixed.id, { amountOre: 999 })).ok, true);
+  assert.equal(l.snapshot().pending, 1);
+  assert.equal(l.snapshot().pendingTransactions[0].kind, "append");
+  assert.equal(l.snapshot().pendingTransactions[0].transaction.amountOre, 999);
+  const cancelled = await remove(l, pendingFixed.id);
+  assert.equal(cancelled.ok, true);
+  assert.equal(l.snapshot().pending, 0);
+  assert.equal((await l.instance.undoDelete(cancelled.operationId)).ok, true);
+  assert.equal(correctionDb.getRecord().outbox[0].fixedCost, true);
+  assert.equal(l.snapshot().state.transactions.find(item => item.id === pendingFixed.id).amountOre, 999);
+  assert.equal((await remove(l, pendingFixed.id)).ok, true);
+  l.online(true);
+  await l.instance.retry();
+  assert.equal(correctionServer.calls.filter(call => call.operation?.transaction?.id === pendingFixed.id).length, 0);
+  console.log("PASS editing, canceling and undoing an unsent purchase avoid unnecessary uploads");
+
+  l.online(false);
+  l.events.get("offline")();
+  const partiallySent = makeTransaction("uncertain-append");
+  assert.equal((await add(l, partiallySent)).ok, true);
+  l.online(true);
+  correctionServer.lostResponse = true;
+  await l.instance.retry();
+  assert.equal(l.snapshot().pending, 1);
+  l.online(false);
+  assert.equal((await edit(l, partiallySent.id, { amountOre: 13500 })).ok, true);
+  assert.equal(l.snapshot().pending, 2);
+  l.online(true);
+  await l.instance.retry();
+  assert.equal(correctionServer.state.transactions.find(item => item.id === partiallySent.id).amountOre, 13500);
+  const duplicateAttempts = correctionServer.calls.filter(call => call.operation?.transaction?.id === partiallySent.id);
+  assert.equal(duplicateAttempts.length, 2);
+  assert.deepEqual(duplicateAttempts[0].operation, duplicateAttempts[1].operation);
+  console.log("PASS an edit after an uncertain append keeps its original idempotent payload");
+
+  l.online(false);
+  l.events.get("offline")();
+  assert.equal((await edit(l, "edit-me", { amountOre: 22000 })).ok, true);
+  assert.equal((await edit(l, "edit-me", { description: "Second local edit" })).ok, true);
+  assert.equal((await add(l, makeTransaction("independent"))).ok, true);
+  correctionServer.state.transactions.find(item => item.id === "edit-me").amountOre = 777;
+  correctionServer.revision++;
+  l.online(true);
+  await l.instance.retry();
+  const conflict = l.snapshot().pendingTransactions.find(item => item.conflict);
+  assert.equal(conflict.kind, "edit");
+  assert.equal(conflict.transaction.amountOre, 22000);
+  assert.equal(conflict.current.amountOre, 777);
+  assert.equal(conflict.canKeepMine, true);
+  assert.equal(l.snapshot().state.transactions.find(item => item.id === "edit-me").amountOre, 777);
+  assert.ok(correctionServer.state.transactions.some(item => item.id === "independent"));
+  assert.equal(l.snapshot().pending, 2);
+  await l.instance.retry();
+  assert.equal(l.snapshot().pendingTransactions[0].operationId, conflict.operationId);
+  assert.equal((await l.instance.keepPending(conflict.operationId, conflict.current)).ok, true);
+  await l.instance.retry();
+  assert.equal(l.snapshot().pending, 0);
+  assert.equal(correctionServer.state.transactions.find(item => item.id === "edit-me").amountOre, 22000);
+  assert.equal(correctionServer.state.transactions.find(item => item.id === "edit-me").description, "Second local edit");
+
+  l.online(false);
+  l.events.get("offline")();
+  assert.equal((await edit(l, "edit-me", { amountOre: 13500 })).ok, true);
+  assert.equal((await remove(l, "edit-me")).ok, true);
+  correctionServer.state.transactions.find(item => item.id === "edit-me").amountOre = 999;
+  correctionServer.revision++;
+  l.online(true);
+  await l.instance.retry();
+  const deleteChain = l.snapshot().pendingTransactions.find(item => item.conflict);
+  assert.equal((await l.instance.discardPending(deleteChain.operationId)).ok, true);
+  assert.equal(l.snapshot().pending, 0);
+  assert.equal(correctionServer.state.transactions.find(item => item.id === "edit-me").amountOre, 999);
+  console.log("PASS conflict choices preserve the other device’s version until explicitly confirmed and handle dependent corrections");
+
+  l.online(false);
+  l.events.get("offline")();
+  const firstFixed = { ...makeTransaction("fixed-device-one", 2000), categoryId: "rent" };
+  assert.equal((await add(l, firstFixed, l.snapshot().state, { fixedCost: true })).ok, true);
+  const extraFixed = { ...firstFixed, id: "fixed-extra" };
+  assert.equal((await add(l, extraFixed, l.snapshot().state, { fixedCost: true })).ok, false);
+  correctionServer.state.transactions.push({ ...firstFixed, id: "fixed-device-two", amountOre: 1800 });
+  correctionServer.revision++;
+  l.online(true);
+  await l.instance.retry();
+  assert.equal(l.snapshot().state.transactions.filter(item => item.categoryId === "rent").length, 1);
+  assert.equal(l.snapshot().state.transactions.find(item => item.categoryId === "rent").id, "fixed-device-two");
+  assert.match(l.snapshot().pendingTransactions[0].error, /longu skrásett/);
+  assert.equal((await l.instance.discardPending(l.snapshot().pendingTransactions[0].operationId)).ok, true);
+  console.log("PASS duplicate fixed charges never inflate the visible synced total");
+
+  const legacyServer = createServer();
+  const legacyItem = makeTransaction("legacy-outbox");
+  const legacyDb = fakeIndexedDB({
+    ownerId: legacyServer.ownerId, offlineAllowed: true, problem: null,
+    server: { revision: 0, state: legacyServer.state },
+    outbox: [{ operationId: "legacy-append-operation", transaction: legacyItem }],
+  });
+  const upgraded = browser(legacyServer, legacyDb, false);
+  await upgraded.instance.start();
+  assert.equal(upgraded.snapshot().state.transactions[0].id, legacyItem.id);
+  upgraded.online(true);
+  await upgraded.instance.retry();
+  assert.equal(upgraded.snapshot().pending, 0);
+  assert.ok(legacyServer.receipts.has("legacy-append-operation"));
+  console.log("PASS a device cache upgrades with an existing purchase and the same operation ID");
+
+  const oldLedger = l.snapshot().state;
+  const longBackup = {
+    ...oldLedger,
+    transactions: Array.from({ length: 1250 }, (_, index) => makeTransaction("backup-" + index)),
+  };
+  assert.equal((await l.instance.save(longBackup, { expectedState: oldLedger, replace: true })).ok, true);
+  assert.equal(correctionServer.state.transactions.length, 1250);
+  assert.equal(correctionServer.calls.at(-1).operation.type, "restore");
+  console.log("PASS the restore flow sends an atomic restore for longer histories");
 }
 
 run().catch((error) => { console.error(error); process.exitCode = 1; });

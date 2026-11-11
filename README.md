@@ -11,10 +11,10 @@ Download or clone this repository and open `index.html` in your browser. The dem
 ## What it does
 
 - Build monthly budgets for expected income, fixed costs, and variable expenses. Copy a previous month's plan without copying its transactions.
-- Record expenses, refunds, and income. Find entries by description, date, or category. Category menus use Faroese alphabetical order.
-- Explore monthly totals, category spending, and insights in **Hagtøl**. Choose a preset or a custom range and open the transactions behind each chart.
-- Download transaction and budget CSVs or a JSON backup that can be restored in the app.
-- Queue new transactions when offline and sync them on reconnection. Editing existing transactions or budgets in the hosted app requires a connection.
+- Record expenses, refunds, and income. Search across months by description, date range, category, or transaction type. The fixed-cost tab fills an entry from a monthly budget line for you to review and save.
+- Close a month and prepare the next plan together. Rename or archive categories for future budgets while keeping historical labels. **Hagtøl** can include the current month to date, with averages and insights still based on completed months.
+- Download transaction and budget CSVs or a JSON backup. Restore previews the changes and asks you to download a safety copy first. A hosted restore can change up to 5,000 records within a 2 MB request.
+- Keep unfinished entry and budget drafts on the device. Add, edit, delete, or undo a transaction offline, then sync it on reconnection. If another device changed the same entry, review both versions. Budget changes and backup restore require a connection.
 
 ## How it works
 

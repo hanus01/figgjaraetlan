@@ -259,7 +259,8 @@ function loadApp(cwd, ledger = createLedger(), options = {}) {
   document.getElementById = id => document.querySelector("#" + id);
   document.createElement = tag => new SimElement(tag);
   Object.defineProperty(document, "body", { get: () => document.querySelector("body") });
-  const storage = new Map([[STORAGE_KEY, JSON.stringify(ledger)]]);
+  const storage = options.storage ?? new Map();
+  if (!storage.has(STORAGE_KEY)) storage.set(STORAGE_KEY, JSON.stringify(ledger));
   const localStorage = {
     getItem: key => storage.get(key) ?? null,
     setItem: (key, value) => storage.set(key, String(value)),
@@ -288,7 +289,7 @@ function loadApp(cwd, ledger = createLedger(), options = {}) {
   assert.equal(context.BudgetCore.validateState(ledger.state), true, "Fixture ledger is valid");
   assert.equal(get("#page-title").textContent, "Yvirlit");
   return {
-    document, get, context, localStorage,
+    document, get, context, localStorage, storage,
     ledger: () => JSON.parse(localStorage.getItem(STORAGE_KEY)),
     click: selector => get(selector).click(),
     change: (selector, value) => {

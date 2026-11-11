@@ -3,7 +3,7 @@ import { DatabaseSync } from 'node:sqlite';
 
 export function createSqliteD1() {
   const sqlite = new DatabaseSync(':memory:');
-  for (const name of ['0001_ledger.sql', '0002_sessions.sql']) {
+  for (const name of ['0001_ledger.sql', '0002_sessions.sql', '0003_ledger_record_receipts.sql']) {
     sqlite.exec(readFileSync(new URL('../cloud/migrations/' + name, import.meta.url), 'utf8'));
   }
 

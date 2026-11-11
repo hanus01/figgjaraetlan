@@ -47,3 +47,11 @@ assert(budgets.includes('"Historical food","0","0.00","2026-10"'));
 assert.equal(csv.transactions({ ...state, transactions: [] }).split('\r\n').length, 2);
 assert.equal(JSON.stringify(state), before);
 console.log('CSV checks passed for exact money, refunds, historical labels, quotes/newlines, spreadsheet formulas, pending records and conflicting IDs.');
+
+
+const deleted = csv.transactions({ ...state, transactions: [] }, {
+  synced: true, pendingEntries: [{ kind: 'delete', transaction: expense }],
+});
+assert(deleted.includes('"12550","125.50","0.00"'));
+assert(deleted.includes('"pending_delete"'));
+console.log('Pending delete rows keep a record of the amount without inflating spending totals.');

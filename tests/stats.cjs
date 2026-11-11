@@ -270,3 +270,24 @@ test("Category detail pages its actual transactions and retains link to an older
 });
 
 console.log("Passed " + checked.length + " simulated-DOM Hagtøl regression cases");
+
+
+test("The optional current month is marked partial and does not affect complete-month averages", () => {
+  const ledger = createLedger();
+  ledger.state.months["2026-11"].status = "active";
+  const partial = loadApp(source, ledger);
+  partial.click("#tab-stats");
+  assert.equal(partial.document.querySelector('[data-chart-month="2026-11"]'), null);
+  const toggle = partial.get("#stats-include-current");
+  toggle.checked = true;
+  partial.change("#stats-include-current", "on");
+  const row = partial.get('[data-chart-month="2026-11"]');
+  assert.equal(row.querySelector('.chart-partial').textContent, 'Higartil');
+  const metrics = partial.document.querySelectorAll('.metric-card');
+  const spent = metrics.find(card => card.textContent.includes('Skrásettar útreiðslur'));
+  const average = metrics.find(card => card.textContent.includes('Miðal útreiðslur'));
+  assert.ok(spent.textContent.includes(format(10000)));
+  assert.ok(average.textContent.includes(format(4500)));
+});
+
+console.log(`Passed ${checked.length} simulated-DOM Hagtøl regression cases`);
