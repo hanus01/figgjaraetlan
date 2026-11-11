@@ -3,12 +3,13 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 
 const read = (name) => readFileSync(new URL(name, import.meta.url), 'utf8');
 const resources = ['manifest.webmanifest', 'icon.svg', 'icon-192.png', 'icon-512.png', 'apple-touch-icon.png'];
-const assets = resources.map((name) => [name, readFileSync(new URL(`cloud/${name}`, import.meta.url))]);
+const assets = new Map(resources.map((name) => [name, readFileSync(new URL(`cloud/${name}`, import.meta.url))]));
+const touchIconVersion = createHash('sha256').update(assets.get('apple-touch-icon.png')).digest('hex').slice(0, 8);
 const inlineScripts = [];
 const html = read('index.html')
   .replace('<link rel="stylesheet" href="styles.css">', () => `<link rel="manifest" href="/manifest.webmanifest">
     <link rel="icon" href="/icon.svg" type="image/svg+xml">
-    <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png?v=${touchIconVersion}">
     <meta name="apple-mobile-web-app-title" content="Fíggjarætlan">
     <style>\n${read('styles.css')}\n</style>`)
   .replace('<script defer src="app.js"></script>', '<script defer src="cloud/sync.js"></script>\n    <script defer src="app.js"></script>')
